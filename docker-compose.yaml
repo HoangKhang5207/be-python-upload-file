@@ -137,6 +137,8 @@ services:
     build: .
     ports:
       - "8000:8000"
+    env_file:
+      - .env
     networks:
       - es-net
     logging:
@@ -145,6 +147,18 @@ services:
         max-size: "100m"
         max-file: "10"
     restart: always
+
+  pgadmin:
+    image: dpage/pgadmin4
+    container_name: my_pgadmin
+    restart: always
+    environment:
+      PGADMIN_DEFAULT_EMAIL: admin@admin.com
+      PGADMIN_DEFAULT_PASSWORD: admin
+    ports:
+      - "5050:80"
+    networks:
+      - es-net
 
 networks:
   es-net:
