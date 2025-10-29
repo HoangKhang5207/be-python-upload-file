@@ -1,0 +1,99 @@
+# Byte-compiled / cached / optimized files
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+
+# Virtual environments
+.venv/
+venv/
+env/
+*.venv
+.Python
+.env.example.local
+.env.example.docker
+
+# Package distribution
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+wheels/
+*.db
+*.egg-info/
+.installed.cfg
+*.egg
+
+# PyInstaller
+*.manifest
+*.spec
+
+# Logs and debugging
+logs/
+*.log
+debug.log
+nohup.out
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Unit test / coverage reports
+htmlcov/
+.tox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+.hypothesis/
+
+# Flask instance and cache
+instance/
+.webassets-cache
+
+# Scrapy
+.scrapy
+
+# Sphinx documentation
+docs/_build/
+
+# PyBuilder
+target/
+
+# Jupyter Notebook
+.ipynb_checkpoints/
+
+# Celery
+celerybeat-schedule
+
+# Environment and secrets
+.env
+*.env
+.env.local
+secrets.json
+config.json
+
+# IDE and editor settings
+.vscode/
+!.vscode/extensions.json
+.idea/
+*.iml
+*.ipr
+*.iws
+
+# OS-generated files
+.DS_Store
+*/.DS_Store
+Thumbs.db
+
+# Docker-related files
+docker/
+docker-compose.override.yml
+volumes/
