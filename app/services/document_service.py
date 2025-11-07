@@ -1,11 +1,13 @@
+import asyncio
 import base64
 import gc
 import io
 import pickle
-import cv2
+import cv2 # Cho khử nhiễu (OpenCV)
 import numpy as np
 import requests
 import time
+import PyPDF2 # Cho Watermark PDF
 from io import BytesIO
 from typing import Union
 import openai
@@ -16,7 +18,9 @@ import json
 from googletrans import Translator
 from skimage.metrics import structural_similarity as ssim
 
+from PIL import Image, ImageDraw, ImageFont, ImageOps # Cho Watermark ảnh
 from pdf2image import convert_from_bytes
+from PyPDF2.errors import PdfReadError
 from pyvi.ViTokenizer import tokenize
 from oauth2client.service_account import ServiceAccountCredentials
 from pydrive.auth import GoogleAuth
@@ -25,6 +29,29 @@ from sklearn.feature_extraction.text import TfidfVectorizer, CountVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 from sqlalchemy.exc import SQLAlchemyError
 from starlette.responses import JSONResponse
+
+from reportlab.pdfgen import canvas # Cho Watermark PDF
+from reportlab.lib.pagesizes import letter
+from reportlab.lib import colors
+from reportlab.lib.units import ImageReader
+
+import zipfile # Để đọc file .docx, .pptx, .xlsx, .odt
+import xml.etree.ElementTree as ET # (Fallback nếu lxml lỗi)
+try:
+    from lxml import etree as lxml_etree
+    XML_PARSER = 'lxml'
+except ImportError:
+    logging.warning("Thư viện 'lxml' không tìm thấy. Sử dụng 'xml.etree.ElementTree' (chậm hơn).")
+    lxml_etree = ET
+    XML_PARSER = 'et'
+    
+# Thư viện cho các định dạng Office
+from pptx import Presentation
+import openpyxl
+from odf.opendocument import load as load_odt
+from odf.text import P
+from odf.meta import DocumentStatistic
+
 import logging
 import bcrypt
 
@@ -34,7 +61,8 @@ from docx import Document as DocxDocument
 import re
 from elasticsearch.helpers import bulk, BulkIndexError, scan
 import string
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
+import magic # Để kiểm tra mime type chính xác hơn
 import os
 from google.cloud import vision
 
@@ -42,7 +70,7 @@ from sqlalchemy import and_, or_, delete
 from app.core.config import settings
 from app.db.engine_default import session_scope
 from app.models.models import Document, UserDocument, User, Organization, Category, PrivateDoc, StarredDoc, \
-    FileUpload, Department
+    FileUpload, Department, PublicLink, WorkflowInstance
 
 elasticsearch_url = settings.ELASTICSEARCH_ENPOINT
 google_application_credentials = settings.GOOGLE_APPLICATION_CREDENTIALS
@@ -57,35 +85,379 @@ openai.api_key = settings.OPENAI_API_KEY_EMBEDDING
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
+def get_mime_type(file_content: bytes) -> str:
+    """Sử dụng 'magic' để xác định MIME type một cách an toàn từ nội dung byte."""
+    try:
+        mime = magic.Magic(mime=True)
+        return mime.from_buffer(file_content)
+    except Exception as e:
+        logging.warning(f"Không thể xác định MIME type: {e}")
+        return "application/octet-stream"
 
-def upload_file_to_drive(upload_file: UploadFile, unique_filename: str):  
-    #win 11
-    #file_directory = './app/file'
-    #Docker
-    #file_directory = '/app/file'
+async def denoise_image(file_content: bytes, filename: str):
+    """
+    UC-39/UC-87: Khử nhiễu cho file ảnh trước OCR (Triển khai thật) 
+    Sử dụng OpenCV fastNlMeansDenoisingColored.
+    """
+    mime_type = get_mime_type(file_content)
+    if not mime_type.startswith('image/'):
+        return {"content": file_content, "denoiseInfo": {"denoised": False, "message": "Không phải file ảnh, bỏ qua khử nhiễu."}}
+        
+    try:
+        nparr = np.frombuffer(file_content, np.uint8)
+        img_cv = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+        if img_cv is None:
+             raise ValueError("Không thể decode ảnh bằng OpenCV")
+             
+        logging.info(f"Đang khử nhiễu cho ảnh: {filename}")
+        
+        # Áp dụng thuật toán khử nhiễu
+        denoised_img = cv2.fastNlMeansDenoisingColored(img_cv, None, 10, 10, 7, 21)
+        
+        # Chuyển ảnh đã xử lý về lại bytes
+        # (Sử dụng đuôi file gốc để encode)
+        file_extension = os.path.splitext(filename)[1]
+        is_success, buffer = cv2.imencode(file_extension, denoised_img)
+        if not is_success:
+            raise ValueError(f"Không thể encode ảnh sang định dạng {file_extension}")
+            
+        denoised_content = buffer.tobytes()
+        
+        return {
+            "content": denoised_content,
+            "denoiseInfo": {
+                "denoised": True,
+                "modelUsed": "cv2.fastNlMeansDenoisingColored",
+                "message": "Khử nhiễu ảnh thành công.",
+                "original_size": len(file_content),
+                "denoised_size": len(denoised_content)
+            }
+        }
+    except Exception as e:
+        logging.error(f"Lỗi khi khử nhiễu ảnh {filename}: {e}")
+        return {"content": file_content, "denoiseInfo": {"denoised": False, "message": f"Lỗi khử nhiễu: {e}"}}
 
-    file_directory=settings.UPLOAD_FILE_DIRECTORY
+async def perform_ocr(file_content: bytes, filename: str):
+    """
+    UC-87: Thực hiện OCR (Wrapper)
+    Trả về nội dung OCR và tổng số trang.
+    Tận dụng các hàm `convert_file_to_content` và `convert_images_to_text` đã có.
+    """
+    try:
+        # 1. Chuyển file bytes (PDF, DOCX, TXT, IMG) thành text hoặc list ảnh
+        images_or_text, total_pages = convert_file_to_content(BytesIO(file_content), filename)
+        
+        # 2. Chuyển ảnh thành text (sử dụng Google Vision API)
+        text = convert_images_to_text(images_or_text)
+        
+        if not text:
+            logging.warning(f"OCR cho file {filename} không trả về nội dung.")
+            
+        return {"ocrContent": text or "", "total_pages": total_pages}
+        
+    except Exception as e:
+        logging.error(f"Lỗi nghiêm trọng trong chuỗi OCR cho file {filename}: {e}")
+        # Trả về 1 nếu lỗi
+        return {"ocrContent": "", "total_pages": 1}
+    
+# *** BỔ SUNG HÀM HELPER NÀY (Cho Highlight) ***
+def _find_context_and_highlight(full_text: str, segment: str, radius_chars: int = 150) -> str:
+    """
+    UC-39/UC-88: Tìm đoạn 'segment' trong 'full_text' và trả về context xung quanh
+    với thẻ <b> highlight.
+    """
+    try:
+        # Tìm vị trí (không phân biệt hoa thường, ký tự đặc biệt)
+        # 1. Chuẩn hóa text
+        clean_text = re.sub(r'\s+', ' ', full_text).lower()
+        clean_segment = re.sub(r'\s+', ' ', segment).lower()
+        
+        index = clean_text.find(clean_segment)
+        if index == -1:
+            return segment # Trả về segment gốc nếu không tìm thấy context
+            
+        # 2. Lấy context dựa trên index đã tìm thấy
+        start = max(0, index - radius_chars)
+        end = min(len(full_text), index + len(segment) + radius_chars)
+        
+        # 3. Lấy chuỗi gốc (có dấu, hoa thường)
+        context_text = full_text[start:end]
+        
+        # 4. Tìm lại segment gốc trong context để highlight
+        # (Tìm cách an toàn, không phân biệt hoa thường)
+        segment_regex = re.compile(re.escape(segment), re.IGNORECASE)
+        highlighted_context = segment_regex.sub(lambda m: f"<b>{m.group(0)}</b>", context_text, count=1)
+        
+        # Thêm "..." nếu bị cắt
+        if start > 0:
+            highlighted_context = "... " + highlighted_context
+        if end < len(full_text):
+            highlighted_context = highlighted_context + " ..."
+            
+        return highlighted_context
+        
+    except Exception as e:
+        logging.error(f"Lỗi khi highlight (UC-88): {e}")
+        return f"<b>{segment}</b>" # Fallback
+
+async def check_duplicates_by_content(
+    ocr_content: str, 
+    organization_id: int, 
+    user_id: int, 
+    similarity_threshold: float = 0.30
+):
+    """
+    UC-39/UC-88: Kiểm tra trùng lặp dựa trên tương đồng ngữ nghĩa (Triển khai thật 100%)
+    """
+    if not ocr_content.strip():
+        logging.warning("Nội dung OCR rỗng, bỏ qua kiểm tra trùng lặp.")
+        return {"isDuplicate": False}
+        
+    try:
+        # 1. Xác định model và index
+        is_openai_org = check_orgnization_open_ai(user_id)
+        index_name = "search_openai" if is_openai_org else "demo_cau"
+        
+        # 2. Vector hóa nội dung mới
+        if is_openai_org:
+            headers = { "Authorization": f"Bearer {settings.OPENAI_API_KEY_EMBEDDING}" }
+            query_vector = get_openai_embeddings_to_search([ocr_content], headers)[0]
+        else:
+            query_vector = embed_str([tokenize(ocr_content)])[0]
+            
+        # 3. Xây dựng truy vấn Elasticsearch
+        score_threshold = (similarity_threshold + 1.0)
+        
+        script_query = {
+            "bool": {
+                "must": {
+                    "script_score": {
+                        "query": { "match_all": {} },
+                        "script": {
+                            "source": "cosineSimilarity(params.query_vector, 'title_vector') + 1.0",
+                            "params": {"query_vector": query_vector}
+                        },
+                        "min_score": score_threshold
+                    }
+                },
+                "filter": [
+                    {"exists": {"field": "title_vector"}},
+                    # --- TRIỂN KHAI YÊU CẦU 1 ---
+                    # (Filter theo organization_id)
+                    {"term": {"organization_id": organization_id}}
+                ]
+            }
+        }
+        
+        # 4. Thực hiện tìm kiếm
+        response = client.search(
+            index=index_name,
+            body={
+                "query": script_query,
+                "_source": ["document_id", "title"], # Lấy content chunk (đang bị lưu vào trường 'title')
+                "size": 1, 
+                "sort": [{"_score": {"order": "desc"}}]
+            },
+            ignore=[400, 404]
+        )
+        
+        hits = response.get("hits", {}).get("hits", [])
+        
+        if not hits:
+            return {"isDuplicate": False}
+            
+        # 5. Xử lý kết quả
+        top_hit = hits[0]
+        similarity_score = top_hit["_score"] - 1.0 
+        duplicate_doc_id = top_hit["_source"]["document_id"]
+        
+        # Lấy content của chunk bị trùng (đang lưu trong trường 'title' của ES)
+        duplicate_sentence_chunk = top_hit["_source"]["title"] 
+
+        with session_scope() as session:
+            duplicate_doc = session.query(Document).filter(Document.id == duplicate_doc_id).first()
+            if not duplicate_doc:
+                 return {"isDuplicate": False} 
+
+            # --- TRIỂN KHAI YÊU CẦU 2 ---
+            # (Highlight đoạn trùng) 
+            # Tìm chunk trùng lặp (`duplicate_sentence_chunk`)
+            # bên trong toàn bộ nội dung OCR mới (`ocr_content`)
+            highlighted_segment = _find_context_and_highlight(
+                full_text=ocr_content, 
+                segment=duplicate_sentence_chunk
+            )
+
+            return {
+                "isDuplicate": True,
+                "duplicateData": {
+                    "similarity": f"{similarity_score * 100:.1f}%",
+                    "highlight": highlighted_segment, # Trả về đoạn highlight
+                    "existingDocument": {
+                        "name": duplicate_doc.title,
+                        "id": duplicate_doc.id,
+                        "owner": duplicate_doc.created_by
+                    }
+                }
+            }
+        
+    except Exception as e:
+        logging.error(f"Lỗi khi kiểm tra trùng lặp nội dung (UC-88): {e}")
+        return {"isDuplicate": False, "message": str(e)}
+
+async def suggest_metadata_from_content(ocr_content: str, filename: str):
+    """
+    UC-73: Gợi ý metadata từ nội dung (Triển khai thật)
+    Sử dụng OpenAI (hàm `call_openai` đã có) để trích xuất KVP, title, tags.
+    """
+    if not ocr_content.strip():
+        logging.warning("Nội dung OCR rỗng, sử dụng tên file làm tiêu đề.")
+        return {
+            "suggestedMetadata": { "title": filename.split('.')[0], "tags": [], "key_values": {} },
+            "warnings": []
+        }
+        
+    try:
+        # Xây dựng prompt chi tiết theo UC-73
+        prompt = (
+            "Phân tích nội dung văn bản sau đây và trả về một đối tượng JSON DUY NHẤT. "
+            "KHÔNG GIẢI THÍCH, CHỈ TRẢ VỀ JSON.\n"
+            "Nội dung văn bản:\n"
+            f"---BEGIN CONTENT---\n{ocr_content[:2000]}\n---END CONTENT---\n\n" # Lấy 2000 ký tự đầu
+            "Đối tượng JSON phải có cấu trúc sau:\n"
+            "{\n"
+            "  \"title\": \"(Gợi ý một tiêu đề ngắn gọn, súc tích cho văn bản)\",\n"
+            "  \"summary\": \"(Gợi ý một đoạn tóm tắt 2-3 câu về nội dung chính)\",\n"
+            "  \"tags\": [\"(từ khóa 1)\", \"(từ khóa 2)\", \"(từ khóa 3)\"],\n"
+            "  \"key_values\": {\n"
+            "    \"so_hieu\": \"(Trích xuất Số hiệu/Số văn bản, ví dụ: 123/QĐ-BGDĐT)\",\n"
+            "    \"ngay_ban_hanh\": \"(Trích xuất Ngày ban hành, định dạng dd/mm/yyyy)\",\n"
+            "    \"co_quan_ban_hanh\": \"(Trích xuất Cơ quan ban hành)\",\n"
+            "    \"nguoi_ky\": \"(Trích xuất Người ký, nếu có)\",\n"
+            "    \"so_luong\": (Trích xuất số lượng dạng SỐ, nếu có, ví dụ: 500),\n"
+            "    \"ngay_hieu_luc\": \"(Trích xuất Ngày hiệu lực, nếu có, dd/mm/yyyy)\"\n"
+            "  }\n"
+            "}\n"
+            "Nếu không tìm thấy thông tin cho trường nào, hãy trả về null cho trường đó."
+        )
+        
+        # (Giả định hàm `call_openai` đã có và trả về CHUỖI JSON)
+        response_text = call_openai(prompt)
+        
+        if not response_text:
+            raise ValueError("OpenAI không trả về kết quả.")
+            
+        # Phân tích chuỗi JSON
+        generated_data = json.loads(response_text)
+        
+        # Xử lý giá trị thiếu (UC-73)
+        key_values = generated_data.get("key_values", {})
+        warnings = []
+        
+        # Điền null hoặc warning cho các trường bị thiếu
+        for key, value in key_values.items():
+            if value is None:
+                warnings.append({
+                    "field": key,
+                    "message": f"Không tìm thấy thông tin cho '{key}'."
+                })
+        
+        # Đảm bảo các trường chính luôn tồn tại
+        suggested_title = generated_data.get("title") or filename.split('.')[0]
+        tags = generated_data.get("tags", [])
+        
+        return {
+            "suggestedMetadata": {
+                "title": suggested_title,
+                "tags": tags,
+                "summary": generated_data.get("summary", ""),
+                "key_values": key_values,
+                "category": 1 # Mặc định "Hành chính"
+            },
+            "warnings": warnings
+        }
+        
+    except Exception as e:
+        logging.error(f"Lỗi khi gợi ý metadata (UC-73): {e}")
+        return {
+            "suggestedMetadata": { "title": filename.split('.')[0], "tags": [], "key_values": {} },
+            "warnings": [{"field": "System", "message": f"Lỗi trích xuất AI: {e}"}]
+        }
+
+def check_data_conflicts(key_values: dict):
+    """
+    UC-39/UC-73: Kiểm tra mâu thuẫn dữ liệu (Triển khai thật)
+    Kiểm tra số lượng âm và ngày vượt quá 20/08/2025.
+    """
+    conflicts = []
+    
+    # Rule 1: Kiểm tra "số lượng" âm (UC-39, UC-73)
+    # (Lưu ý: Tên trường 'so_luong' phải khớp với kết quả từ suggest_metadata)
+    so_luong = key_values.get("so_luong")
+    if so_luong is not None:
+        try:
+            # Thử ép kiểu về số, phòng trường hợp AI trả về "500"
+            numeric_so_luong = float(so_luong)
+            if numeric_so_luong < 0:
+                conflicts.append({
+                    "field": "so_luong",
+                    "value": so_luong,
+                    "message": f"Giá trị mâu thuẫn: Số lượng ({so_luong}) không thể là số âm."
+                })
+        except (ValueError, TypeError):
+            pass # Bỏ qua nếu không phải là số
+
+    # Rule 2: Kiểm tra "ngày ban hành" vượt quá 20/08/2025 (UC-39, UC-73)
+    ngay_ban_hanh_str = key_values.get("ngay_ban_hanh")
+    if ngay_ban_hanh_str:
+        try:
+            # (AI có thể trả về nhiều định dạng, ở đây xử lý dd/mm/yyyy)
+            doc_date = datetime.strptime(ngay_ban_hanh_str, "%d/%m/%Y")
+            # (Tham chiếu Thông tư 05/2025)
+            cutoff_date = datetime(2025, 8, 20) 
+            
+            if doc_date > cutoff_date:
+                conflicts.append({
+                    "field": "ngay_ban_hanh",
+                    "value": ngay_ban_hanh_str,
+                    "message": f"Giá trị mâu thuẫn: Ngày ban hành ({ngay_ban_hanh_str}) vượt quá mốc thời gian (20/08/2025)."
+                })
+        except (ValueError, TypeError):
+            # Bỏ qua nếu định dạng ngày không hợp lệ
+            logging.warning(f"Không thể parse ngày '{ngay_ban_hanh_str}' để kiểm tra mâu thuẫn.")
+            
+    return {"conflicts": conflicts}
+
+async def embed_watermark_preview(file_content: bytes, filename: str):
+    """
+    UC-39: Chỉ là bước xử lý giả lập, trả về thông báo cho Giai đoạn 1.
+    Watermark thật sẽ được nhúng ở Giai đoạn 2 (embed_watermark_final).
+    """
+    await asyncio.sleep(0.1) # Giả lập
+    return {
+        "watermarkInfo": {
+            "success": True,
+            "message": "Sẵn sàng nhúng watermark 'Confidential - INNOTECH' (nếu cần).",
+        }
+    }
+
+# *** THAY THẾ HÀM NÀY ***
+def upload_file_to_drive(file_content: bytes, unique_filename: str):  
+    """
+    Tải file (dưới dạng bytes) lên Google Drive và lưu tạm 1 bản local.
+    """
+    file_directory = settings.UPLOAD_FILE_DIRECTORY
     os.makedirs(file_directory, exist_ok=True)
     
-    print("file directory",file_directory)
+    # Lưu file local (để các tiến trình background khác có thể truy cập nếu cần)
+    local_file_path = os.path.join(file_directory, unique_filename)
     
-
-    # Save the local file path
-    #win 11
-    #local_file_path = f'./app/file/{unique_filename}'
-    #dockerdocker
-    #local_file_path = f'/app/file/{unique_filename}'
-    local_file_path = file_directory + '/' + unique_filename
-
-    
-    
-    print("local file path",local_file_path)
-    
-    # Reset the file pointer to the start of the file
-    upload_file.file.seek(0)
-
-    with open(local_file_path, 'wb') as f:
-        f.write(upload_file.file.read())
+    try:
+        with open(local_file_path, 'wb') as f:
+            f.write(file_content)
+    except Exception as e:
+        logging.error(f"Không thể ghi file local {local_file_path}: {e}")
+        raise
 
     gauth = GoogleAuth()
     scope = ['https://www.googleapis.com/auth/drive']
@@ -105,10 +477,14 @@ def upload_file_to_drive(upload_file: UploadFile, unique_filename: str):
         })
         file_id = uploaded_file.get('id')
         file_url = uploaded_file['alternateLink']
+        
+        # Trả về đường dẫn local để hàm insert_file_upload (nếu cần)
         return file_id, file_url, local_file_path
     else:
-        raise Exception("File upload failed")
-
+        # Xóa file local nếu upload lỗi
+        if os.path.exists(local_file_path):
+            os.remove(local_file_path)
+        raise Exception("File upload failed to Google Drive")
 
 def format_document_number(doc_number):
     if not doc_number:
@@ -259,19 +635,67 @@ def validate_file(file: UploadFile):
     return True
 
 
-def convert_file_to_content(file: BytesIO, filename: str) -> Union[str, list]:
-    print("Bắt đầu convert_file_to_content")
-    file_format = filename.split(".")[-1]
+def convert_file_to_content(file: BytesIO, filename: str) -> (Union[str, list], int):
+    """
+    Chuyển đổi file (bytes) sang nội dung (text hoặc list ảnh)
+    VÀ trả về tổng số trang (total_pages) thực tế.
+    """
+    print(f"Bắt đầu convert_file_to_content cho: {filename}")
+    file_format = filename.split(".")[-1].lower()
+    total_pages = 1 # Mặc định là 1 (cho các file không thể đếm)
+    text_content = "" # Nội dung text
+    images_content = None # Nội dung ảnh (cho PDF)
+    
+    file.seek(0) # Đảm bảo con trỏ file ở đầu
 
     if file_format == "pdf":
         pdf_bytes = file.read()
-        images = convert_from_bytes(pdf_bytes)
-        return images
+        file.seek(0)
+        
+        # 1. Dùng pdf2image để lấy ảnh (cho OCR)
+        images_content = convert_from_bytes(pdf_bytes)
+        
+        # 2. Dùng PyPDF2 để đếm trang (chính xác)
+        try:
+            pdf_reader = PyPDF2.PdfReader(file)
+            total_pages = len(pdf_reader.pages)
+        except Exception as e_count:
+            logging.warning(f"Không thể đếm trang PDF: {e_count}. Dùng count của pdf2image.")
+            total_pages = len(images_content)
+            
+        # (images_content sẽ được xử lý bởi `convert_images_to_text`)
+        return images_content, total_pages
 
     elif file_format in ["docx", "doc"]:
+        # Lấy text
         docx_document = DocxDocument(file)
-        text = "\n".join([paragraph.text for paragraph in docx_document.paragraphs])
-        return text
+        text_content = "\n".join([paragraph.text for paragraph in docx_document.paragraphs])
+        
+        # Đếm trang (Cách 1: Đọc metadata)
+        # DOCX là file ZIP. Chúng ta sẽ đọc file 'docProps/app.xml'
+        try:
+            file.seek(0)
+            with zipfile.ZipFile(file, 'r') as docx_zip:
+                app_xml = docx_zip.read('docProps/app.xml')
+                # (Sử dụng lxml nếu có)
+                root = lxml_etree.fromstring(app_xml)
+                # Namespace cho docProps
+                ns = {'ep': 'http://schemas.openxmlformats.org/officeDocument/2006/extended-properties'}
+                
+                # Tìm thẻ <Pages>
+                pages_tag = root.find('.//ep:Pages', namespaces=ns)
+                if pages_tag is not None and pages_tag.text.isdigit():
+                    total_pages = int(pages_tag.text)
+                else:
+                    # (Cách 2: Fallback - Đếm ngắt trang thủ công - phức tạp, tạm thời giữ 1)
+                    logging.warning(f"Không tìm thấy <Pages> tag trong app.xml cho file {filename}. Tạm tính 1 trang.")
+                    total_pages = 1 # (Việc đếm thủ công (manual break) rất không chính xác)
+                    
+        except Exception as e_docx:
+            logging.error(f"Lỗi khi đếm trang DOCX {filename}: {e_docx}. Tạm tính 1 trang.")
+            total_pages = 1
+            
+        return text_content, total_pages
 
     elif file_format == "txt":
         try:
@@ -282,41 +706,55 @@ def convert_file_to_content(file: BytesIO, filename: str) -> Union[str, list]:
                 text = file.read().decode('iso-8859-1')
             except UnicodeDecodeError:
                 raise HTTPException(status_code=400, detail="Mã hóa tệp không được hỗ trợ.")
-        return text
+        total_pages = 1 
+        return text, total_pages
 
     elif file_format == "xlsx":
         try:
             import pandas as pd
             xlsx = pd.ExcelFile(file)
-            text = ""
+            text_content = ""
             for sheet_name in xlsx.sheet_names:
                 df = xlsx.parse(sheet_name, header=None)
-                # Ensure all values in the DataFrame are strings
                 df = df.astype(str)
-                # Concatenate all rows into a single string
-                text += df.apply(lambda x: ' '.join(x), axis=1).str.cat(sep='\n')
-                text += "\n"
-            return text
+                text_content += df.apply(lambda x: ' '.join(x), axis=1).str.cat(sep='\n')
+                text_content += "\n"
         except ImportError:
-            raise HTTPException(status_code=500,
-                                detail="Thiếu phụ thuộc tùy chọn 'openpyxl'. Vui lòng cài đặt nó bằng pip hoặc conda.")
+            raise HTTPException(status_code=500, detail="Thiếu 'pandas' hoặc 'openpyxl'.")
+            
+        # Đếm trang (Excel không có "trang", ta đếm "worksheets")
+        try:
+            file.seek(0)
+            wb = openpyxl.load_workbook(file, read_only=True)
+            total_pages = len(wb.sheetnames) # Đếm số lượng worksheets
+        except Exception as e_xlsx:
+            logging.error(f"Lỗi khi đếm sheet XLSX {filename}: {e_xlsx}. Tạm tính 1 trang.")
+            total_pages = 1
+            
+        return text_content, total_pages
 
     elif file_format == "pptx":
         from pptx import Presentation
+        file.seek(0)
         ppt = Presentation(file)
-        text = ""
+        text_content = ""
         for slide in ppt.slides:
             for shape in slide.shapes:
                 if hasattr(shape, "text"):
-                    text += shape.text + "\n"
-        return text
+                    text_content += shape.text + "\n"
+                    
+        # Đếm trang (PPTX đếm "slides")
+        total_pages = len(ppt.slides) # Đếm số lượng slides
+        
+        return text_content, total_pages
 
     elif file_format in ["odt", "rtf"]:
         from pyth.plugins.rtf15.reader import Rtf15Reader
         from pyth.plugins.plaintext.writer import PlaintextWriter
         doc = Rtf15Reader.read(file)
         text = PlaintextWriter.write(doc).getvalue()
-        return text
+        total_pages = 1
+        return text, total_pages
 
     else:
         raise HTTPException(status_code=400, detail="Định dạng tệp không hợp lệ!")
@@ -388,8 +826,8 @@ def split_text_into_chunks(text):
     chunks = re.split(r'\n\n|\.\s*\n', text)
     return chunks
 
-
-def create_embeddings_and_store(texts: str, filename: str, category_id: int, document_id: int, type_doc: str):
+# *** THAY THẾ HÀM NÀY (Thêm organization_id) ***
+def create_embeddings_and_store(texts: str, filename: str, category_id: int, document_id: int, type_doc: str, organization_id: int):
     print("Starting create_embeddings_and_store")
     text = ""
     for i in texts:
@@ -399,8 +837,9 @@ def create_embeddings_and_store(texts: str, filename: str, category_id: int, doc
     data = sent_tokenizer.sentences_from_text(sentences)
 
     try:
-        result = preprocessing_indexing_elasticsearch(data, filename, category_id, document_id, type_doc)
-        index_batch(result)
+        # Truyền organization_id vào
+        result = preprocessing_indexing_elasticsearch(data, filename, category_id, document_id, type_doc, organization_id)
+        index_batch(result) # (Hàm index_batch không cần đổi, vì nó chỉ đẩy 'result' đi)
         print("Indexing completed successfully")
     except Exception as e:
         print(f"An error occurred during indexing: {e}")
@@ -457,7 +896,8 @@ def index_batch(docs):
         gc.collect()
 
 
-def preprocessing_indexing_elasticsearch(arr_input, filename, category_id, document_id, type_doc):
+# *** THAY THẾ HÀM NÀY (Thêm organization_id) ***
+def preprocessing_indexing_elasticsearch(arr_input, filename, category_id, document_id, type_doc, organization_id: int):
     result = []
     dem = 0
     for i in range(len(arr_input)):
@@ -466,35 +906,223 @@ def preprocessing_indexing_elasticsearch(arr_input, filename, category_id, docum
         if len(arr_input[i]) < 12:
             continue
         dem = dem + 1
-        result.append({'id': dem, 'title': arr_input[i], 'doc_id': filename, 'category_id': category_id,
-                       'document_id': document_id, 'type': type_doc})
+        result.append({
+            'id': dem, 
+            'title': arr_input[i], # 'title' thực ra là 'content chunk'
+            'doc_id': filename, 
+            'category_id': category_id,
+            'document_id': document_id, 
+            'type': type_doc,
+            'organization_id': organization_id # <-- TRƯỜNG MỚI QUAN TRỌNG
+        })
     return result
 
+async def embed_watermark_final(file_content: bytes, filename: str, confidentiality: str):
+    """
+    UC-39 (Step 3.2): Nhúng watermark THẬT sự 
+    - PUBLIC: Nhúng logo INNOTECH (dạng ảnh)
+    - INTERNAL/LOCKED: Nhúng text "Confidential - INNOTECH"
+    """
+    mime_type = get_mime_type(file_content)
+    
+    # 1. XỬ LÝ FILE ẢNH (JPG, PNG)
+    if mime_type.startswith('image/'):
+        try:
+            image = Image.open(BytesIO(file_content)).convert("RGBA")
+            txt_overlay = Image.new("RGBA", image.size, (255, 255, 255, 0))
+            draw = ImageDraw.Draw(txt_overlay)
+            
+            # Giả sử font đã có trong thư mục (cần cho Python 3.8-slim)
+            # Bạn cần đảm bảo file "arial.ttf" tồn tại trong thư mục Be-python/app
+            font_path = os.path.join(os.path.dirname(__file__), '..', 'arial.ttf')
+            if not os.path.exists(font_path):
+                # Fallback nếu không có font
+                font_path = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf" # Đường dẫn phổ biến trên Linux
+                if not os.path.exists(font_path):
+                    logging.warning("Không tìm thấy font. Watermark text có thể không hoạt động.")
+                    font = ImageFont.load_default()
+                else:
+                    font = ImageFont.truetype(font_path, size=40)
+            else:
+                 font = ImageFont.truetype(font_path, size=40)
+
+            if confidentiality == "PUBLIC":
+                # UC-39: Nhúng logo INNOTECH
+                # (Giả sử bạn có file logo-teal.png trong thư mục Be-python/)
+                logo_path = os.path.join(os.path.dirname(__file__), '..', 'logo-teal.png')
+                if os.path.exists(logo_path):
+                    logo = Image.open(logo_path).convert("RGBA")
+                    # Resize logo (ví dụ: bằng 1/5 chiều rộng ảnh)
+                    logo_width = image.width // 5
+                    logo_height = int(logo.height * (logo_width / logo.width))
+                    logo = logo.resize((logo_width, logo_height), Image.Resampling.LANCZOS)
+                    
+                    # Đặt opacity cho logo
+                    logo = Image.eval(logo, lambda p: min(p, 100)) # 100/255 opacity (khoảng 40%)
+                    
+                    # Vị trí (ví dụ: góc dưới bên phải)
+                    position = (image.width - logo_width - 20, image.height - logo_height - 20)
+                    txt_overlay.paste(logo, position, logo)
+                else:
+                    logging.warning(f"Không tìm thấy file logo tại {logo_path}")
+
+            elif confidentiality == "INTERNAL" or confidentiality == "LOCKED":
+                # UC-39: Nhúng text ẩn "Confidential - INNOTECH"
+                text = "Confidential - INNOTECH"
+                fill_color = (255, 0, 0, 60) # Màu đỏ, mờ (alpha 60/255)
+                
+                # Tính toán vị trí (xoay và trung tâm)
+                draw.text((0,0), text, font=font, fill=fill_color)
+                text_bbox = draw.textbbox((0, 0), text, font=font)
+                text_width = text_bbox[2] - text_bbox[0]
+                text_height = text_bbox[3] - text_bbox[1]
+                
+                # Tạo ảnh text đã xoay
+                text_image = Image.new('RGBA', (text_width, text_height), (255, 255, 255, 0))
+                text_draw = ImageDraw.Draw(text_image)
+                text_draw.text((0, 0), text, font=font, fill=fill_color)
+                rotated_text = text_image.rotate(45, expand=True, fillcolor=(0,0,0,0))
+                
+                # Dán ảnh đã xoay vào trung tâm overlay
+                x = (image.width - rotated_text.width) // 2
+                y = (image.height - rotated_text.height) // 2
+                txt_overlay.paste(rotated_text, (x, y), rotated_text)
+            
+            # Kết hợp ảnh gốc và overlay
+            out_image = Image.alpha_composite(image, txt_overlay)
+            
+            byte_arr = BytesIO()
+            # Lưu ảnh về lại định dạng gốc (nếu là PNG) hoặc JPG (nếu là TIFF/...)
+            file_format = "PNG" if mime_type == "image/png" else "JPEG"
+            out_image.convert("RGB").save(byte_arr, format=file_format)
+            return byte_arr.getvalue()
+
+        # 2. XỬ LÝ FILE PDF
+        except Exception as e_img:
+            logging.error(f"Lỗi khi nhúng watermark ảnh {filename}: {e_img}")
+            return file_content # Trả về file gốc nếu lỗi
+            
+    elif mime_type == 'application/pdf':
+        try:
+            watermark_bytes = BytesIO()
+            c = canvas.Canvas(watermark_bytes, pagesize=letter)
+            
+            if confidentiality == "PUBLIC":
+                # UC-39: Nhúng logo INNOTECH
+                logo_path = os.path.join(os.path.dirname(__file__), '..', 'logo-teal.png')
+                if os.path.exists(logo_path):
+                    logo = ImageReader(logo_path)
+                    # Vị trí góc dưới bên phải
+                    c.drawImage(logo, letter[0] - 1.2*inch, 0.5*inch, width=1*inch, preserveAspectRatio=True, mask='auto', anchor='c')
+                else:
+                    logging.warning(f"Không tìm thấy file logo tại {logo_path}")
+                    
+            elif confidentiality == "INTERNAL" or confidentiality == "LOCKED":
+                # UC-39: Nhúng text ẩn "Confidential - INNOTECH"
+                text = "Confidential - INNOTECH"
+                c.setFont("Helvetica", 50)
+                c.setFillColor(colors.red, alpha=0.15) # Màu đỏ, rất mờ
+                c.saveState()
+                c.translate(letter[0]/2, letter[1]/2) # Trung tâm
+                c.rotate(45) # Xoay 45 độ
+                c.drawCentredString(0, 0, text)
+                c.restoreState()
+            
+            c.save()
+            watermark_bytes.seek(0)
+            
+            # Đọc watermark vừa tạo
+            watermark_pdf = PyPDF2.PdfReader(watermark_bytes)
+            if not watermark_pdf.pages:
+                raise ValueError("Tạo trang watermark thất bại.")
+            watermark_page = watermark_pdf.pages[0]
+            
+            output_writer = PyPDF2.PdfWriter()
+            input_pdf = PyPDF2.PdfReader(BytesIO(file_content))
+            
+            # Lặp qua từng trang của PDF gốc và merge watermark
+            for page in input_pdf.pages:
+                page.merge_page(watermark_page)
+                output_writer.add_page(page)
+                
+            output_bytes = BytesIO()
+            output_writer.write(output_bytes)
+            return output_bytes.getvalue()
+
+        except (PdfReadError, Exception) as e_pdf:
+            logging.error(f"Lỗi khi nhúng watermark PDF {filename}: {e_pdf}. Trả về file gốc.")
+            return file_content
+
+    # 3. XỬ LÝ DOCX (Vẫn log cảnh báo)
+    elif "wordprocessingml" in mime_type:
+        logging.warning(f"Watermark cho DOCX ({filename}) không được hỗ trợ tự động trên server. Bỏ qua...")
+        return file_content
+
+    else:
+        # Các định dạng khác (MP4, MP3...)
+        return file_content
 
 async def insert_document(filename: str, user: User, category_id: int, description: str,
-                          total_pages: int, file_type: str, file_id: str, file_path: str, storage_capacity: int,
-                          storage_unit: str, access_type: int, organization_id: int, dept_id: int, photo_id: str,
-                          content: str = ""):
+                          file_type: str, file_id: str, file_path: str, storage_capacity: int,
+                          storage_unit: str, photo_id: str, total_pages: int,
+                          # --- Tham số mới ---
+                          final_metadata: dict,
+                          status_str: str, # "DRAFT"
+                          version: str): # "1.0"
     with session_scope() as session:
         created_by = user.email if user else None
-        content = content if content is not None else ""
+        
+        # Trích xuất metadata từ object mới
+        title = final_metadata.get('title', filename)
+        access_type_str = final_metadata.get('access_type', 'private')
+        confidentiality = final_metadata.get('confidentiality', 'INTERNAL')
+        
+        # --- ÁNH XẠ LOGIC (Rất quan trọng) ---
+        
+        # 1. Ánh xạ Status (String) sang Status (Integer)
+        # Dựa trên model `Document.status` và UC-39
+        status_mapping = {
+            "DRAFT": 1, 
+            "PROCESSING_WORKFLOW": 2, # (Sẽ được cập nhật bởi auto-route)
+            "APPROVED": 3,
+            "DELETED": 0
+        }
+        status_int = status_mapping.get(status_str, 1) # Mặc định là DRAFT (1)
+
+        # 2. Ánh xạ Access Type (String) sang Access Type (Integer) và is_paid (Boolean)
+        # Dựa trên model `Document.access_type` và UC-39
+        access_type_mapping = {
+            "public": 1,
+            "paid": 1, # 'paid' vẫn là access_type=1 (public)
+            "private": 4 # (Giả sử 4 là private)
+            # (Bạn cần định nghĩa 2=Org, 3=Dept nếu frontend hỗ trợ)
+        }
+        access_type_int = access_type_mapping.get(access_type_str, 4)
+        is_paid_flag = (access_type_str == 'paid') # Cờ cho UC-85
+        
         document = Document(
-            title=filename,
-            status=1,
-            content=content,
+            title=title,
+            status=status_int, # Đã ánh xạ
+            content=final_metadata.get('ocrContent', None), # Lưu nội dung OCR (UC-87)
             created_by=created_by,
             type=file_type,
             total_page=total_pages,
-            description=description,
+            description=description or final_metadata.get('summary', None), # Dùng summary nếu desc rỗng
             category_id=category_id,
             file_id=file_id,
             file_path=file_path,
             storage_capacity=storage_capacity,
             storage_unit=storage_unit,
-            access_type=access_type,
-            organization_id=organization_id,
-            dept_id=dept_id,
+            access_type=access_type_int, # Đã ánh xạ
+            organization_id=user.organization_id,
+            dept_id=user.dept_id,
             photo_id=photo_id,
+            
+            # --- Các trường mới từ Model (đã cập nhật) ---
+            version=version, # "1.0"
+            confidentiality=confidentiality, # "INTERNAL", "PUBLIC", "LOCKED"
+            tags_json=json.dumps(final_metadata.get('tags', [])),
+            is_paid=is_paid_flag # True/False
         )
 
         session.add(document)
@@ -526,6 +1154,124 @@ async def insert_document(filename: str, user: User, category_id: int, descripti
 
     return document
 
+# *** BỔ SUNG HÀM NÀY ***
+async def trigger_auto_route(document: Document, metadata: dict, user: User):
+    """
+    UC-39/UC-84: Tự động luân chuyển (Auto-Route)
+    """
+    try:
+        # Lấy dữ liệu metadata đã được chốt
+        category_id = metadata.get('category_id')
+        confidentiality = metadata.get('confidentiality')
+        
+        # (Giả định trạng thái Status: 1=DRAFT, 2=PROCESSING_WORKFLOW)
+        STATUS_DRAFT = 1
+        STATUS_PROCESSING = 2
+        
+        triggered_rule = None
+        
+        # --- ĐỊNH NGHĨA QUY TẮC (RULES) ---
+        # (Trong thực tế, nên đọc từ CSDL)
+        
+        # RULE 1: Báo cáo tài chính (category=1) -> Gửi cho Kế toán trưởng
+        if str(category_id) == "1": # (Frontend gửi ID dạng số, nhưng form là string)
+            triggered_rule = {
+                "workflow_name": "Quy trình duyệt Báo cáo Tài chính",
+                "process_key": "finance_report_process_v1",
+                "candidate_group": "PHONG_KE_TOAN" # Nhóm người nhận
+            }
+            
+        # RULE 2: Tài liệu mật (LOCKED) -> Gửi cho Ban An Ninh
+        elif confidentiality == "LOCKED":
+            triggered_rule = {
+                "workflow_name": "Quy trình xử lý Tài liệu Mật",
+                "process_key": "security_confidential_v1",
+                "candidate_group": "BAN_AN_NINH"
+            }
+        
+        # --- KÍCH HOẠT WORKFLOW NẾU CÓ RULE ---
+        if triggered_rule:
+            with session_scope() as session:
+                # 1. Tạo bản ghi WorkflowInstance (UC-84)
+                instance = WorkflowInstance(
+                    document_id=document.id,
+                    workflow_name=triggered_rule["workflow_name"],
+                    process_key=triggered_rule["process_key"],
+                    status="PENDING", 
+                    triggered_by_user_id=user.id,
+                    candidate_group=triggered_rule["candidate_group"]
+                )
+                session.add(instance)
+                
+                # 2. Cập nhật trạng thái tài liệu
+                doc_to_update = session.query(Document).filter(Document.id == document.id).first()
+                if doc_to_update:
+                    doc_to_update.status = STATUS_PROCESSING # Chuyển từ DRAFT (1) -> PROCESSING (2)
+                
+                session.commit()
+
+            logging.info(f"Đã kích hoạt Auto-Route (UC-84) cho DocID {document.id}. Chuyển đến {triggered_rule['candidate_group']}")
+            
+            return {
+                "triggered": True,
+                "workflow": { 
+                    "name": triggered_rule["workflow_name"], 
+                    "id": triggered_rule["process_key"] 
+                },
+                "message": f"Đã tự động gửi tài liệu đến: {triggered_rule['candidate_group']}.",
+            }
+
+        # Không có rule nào khớp
+        logging.info(f"Không có Auto-Route (UC-84) nào khớp cho DocID {document.id}.")
+        return {"triggered": False, "message": "Không có quy trình tự động nào được kích hoạt."}
+        
+    except Exception as e:
+        logging.error(f"Lỗi khi trigger auto-route (UC-84): {e}")
+        return {"triggered": False, "message": f"Lỗi auto-route: {e}"}
+
+# *** BỔ SUNG CÁC HÀM NÀY (UC-85/86) ***
+async def save_public_link(doc_id: int):
+    """
+    UC-86: Tạo liên kết chia sẻ công khai với thời hạn 72 giờ
+    Sử dụng model PublicLink đã thêm.
+    """
+    with session_scope() as session:
+        # Đảm bảo không tạo link trùng
+        existing_link = session.query(PublicLink).filter(
+            PublicLink.document_id == doc_id,
+            PublicLink.is_active == True,
+            PublicLink.expires_at > datetime.now()
+        ).first()
+        
+        if existing_link:
+            token = existing_link.token
+        else:
+            new_link = PublicLink(
+                document_id=doc_id,
+                # expires_at (đã được default 72h trong model)
+            )
+            session.add(new_link)
+            session.commit()
+            session.refresh(new_link)
+            token = new_link.token
+        
+        # (Cần định nghĩa APP_DOMAIN trong config.py)
+        app_domain = getattr(settings, "APP_DOMAIN", "http://localhost:5173")
+        full_link = f"{app_domain}/public/view/{token}"
+        return full_link
+
+async def setup_paid_access(doc_id: int):
+    """
+    UC-85: Thiết lập tài liệu này cần thanh toán
+    """
+    with session_scope() as session:
+        doc = session.query(Document).filter(Document.id == doc_id).first()
+        if doc:
+            doc.is_paid = True
+            session.commit()
+            logging.info(f"Đã thiết lập is_paid=True cho document ID: {doc_id}")
+        else:
+            logging.error(f"Không tìm thấy document ID: {doc_id} để thiết lập paid access.")
 
 def delete_sentences_in_elasticsearch(document_id: int, user_id: int):
     es = Elasticsearch([elasticsearch_url])
@@ -1828,7 +2574,7 @@ def process_upload_by_openai_test(doc_id: int, local_file_path: str, user_id: in
     if retries == max_retries:
         print("Đã đạt tới số lần thử lại tối đa, công việc thất bại.")
 
-
+# *** THAY THẾ HÀM NÀY (Thêm organization_id) ***
 def create_embeddings_and_store_openai(texts: str, filename: str, category_id: int, document_id: int, type_doc: str,
                                        orgnization_id: int):
     text = ""
@@ -1839,7 +2585,8 @@ def create_embeddings_and_store_openai(texts: str, filename: str, category_id: i
 
     data = sent_tokenizer.sentences_from_text(sentences)
 
-    result = preprocessing_indexing_elasticsearch(data, filename, category_id, document_id, type_doc)
+    # Truyền organization_id vào
+    result = preprocessing_indexing_elasticsearch(data, filename, category_id, document_id, type_doc, orgnization_id)
     index_batch_open_ai(result, orgnization_id)
 
     # Clear memory

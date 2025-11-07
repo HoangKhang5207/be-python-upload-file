@@ -8,6 +8,9 @@ from typing import Union
 from fastapi import APIRouter, UploadFile, Body, Request, HTTPException, File
 from pydantic import BaseModel
 from datetime import date
+import time
+import mimetypes
+import json
 from fastapi.responses import JSONResponse
 from transformers import RobertaModel
 from app.core.config import settings
@@ -19,7 +22,22 @@ from elasticsearch import Elasticsearch
 from app.services.document_service import (insert_document, update_category_in_elasticsearch, document_to_dict,
                                            insert_file_upload, generate_image_description, search_image_descriptions,
                                            serialize_document, check_plagiarism, compare_document_similarity,
-                                           get_image_from_db, create_image_from_base64, calculate_ssim)
+                                           get_image_from_db, create_image_from_base64, calculate_ssim,
+                                           get_user_by_id, get_category_by_id, check_duplicate_document, process_file,
+                                           
+                                        get_mime_type,
+                                        denoise_image,
+                                        perform_ocr,
+                                        check_duplicates_by_content,
+                                        suggest_metadata_from_content,
+                                        check_data_conflicts,
+                                        embed_watermark_preview,
+                                        
+                                        embed_watermark_final,
+                                        upload_file_to_drive, # (Hàm đã được cập nhật)
+                                        trigger_auto_route,
+                                        save_public_link
+                                           )
 
 router = APIRouter()
 model = settings.MODEL
@@ -39,23 +57,183 @@ SCOPES = ['https://www.googleapis.com/auth/drive']
 # )
 #drive_service = build('drive', 'v3', credentials=credentials)
 
+# (Các hằng số cho UC-39)
+MAX_FILE_SIZE_MB = 50
+MAX_FILE_SIZE_BYTES = MAX_FILE_SIZE_MB * 1024 * 1024
+# Định dạng file được phép theo UC-39
+ALLOWED_MIME_TYPES = [
+    'application/pdf', 
+    'application/vnd.openxmlformats-officedocument.wordprocessingml.document', # .docx
+    'image/jpeg', 
+    'image/png', 
+    'image/tiff', 
+    'video/mp4', 
+    'audio/mpeg', # .mp3
+    'video/x-msvideo', # .avi
+    'audio/wav' # .wav
+]
+# Ngưỡng trùng lặp (UC-39/UC-88)
+DUPLICATE_THRESHOLD = 0.30
 
-@router.post("/insert")
-async def process_document(request: Request, upload_file: UploadFile,
-                           description: str = Body(...),
-                           category_id: int = Body(...),
-                           access_type: int = Body(...),
-                           organization_id: int = Body(None),
-                           dept_id: int = Body(None)):
+# =========================================================================
+# API GIAI ĐOẠN 1: XỬ LÝ (Processing)
+# (Khớp với hàm `processFile` của frontend UC39_UploadPage.jsx)
+# =========================================================================
+
+@router.post("/process_upload", tags=["Document"])
+async def process_upload_file(
+    request: Request,
+    upload_file: UploadFile = File(...),
+    duplicate_check_enabled: bool = Body(True)
+):
+    """
+    API Giai đoạn 1 (UC-39):
+    Thực hiện các bước xử lý file (Denoise, OCR, Check Trùng lặp, Gợi ý Metadata)
+    và trả về JSON cho frontend review (Step 3).
+    """
     try:
-        user_id = 1 # TẠM THỜI HARDCODE ĐỂ TEST
+        # Bước 1: Kiểm tra quyền (RBAC: documents:upload)
+        # (Sử dụng user_id từ middleware, tạm hardcode)
         # user_id = request.scope['user_id']
+        user_id = 1 # TẠM THỜI HARDCODE ĐỂ TEST
+        user = document_service.get_user_by_id(user_id)
+        if not user:
+             raise HTTPException(status_code=403, detail="Không tìm thấy người dùng.")
+        
+        # (Giả lập kiểm tra RBAC)
+        # if not user.can('documents:upload'):
+        #     raise HTTPException(status_code=403, detail="403: Insufficient permissions (documents:upload)")
+
+        # Đọc nội dung file
+        file_content = await upload_file.read()
+        await upload_file.seek(0) # Reset con trỏ file
+
+        # Bước 2: Kiểm tra định dạng và kích thước (UC-39)
+        if len(file_content) > MAX_FILE_SIZE_BYTES:
+             raise HTTPException(status_code=400, detail=f"400: Kích thước file vượt quá {MAX_FILE_SIZE_MB}MB.")
+        
+        file_mime_type = document_service.get_mime_type(file_content)
+        if file_mime_type not in ALLOWED_MIME_TYPES:
+             raise HTTPException(status_code=400, detail=f"400: Định dạng file {file_mime_type} không được hỗ trợ.")
+
+        # --- Bắt đầu luồng xử lý (Step 2 - 4) ---
+
+        # Bước 3: Khử nhiễu (UC-39 Denoise)
+        denoise_result = await document_service.denoise_image(file_content, upload_file.filename)
+
+        # Bước 4: OCR & Đếm trang (UC-87)
+        # (Sử dụng content đã khử nhiễu)
+        ocr_result = await document_service.perform_ocr(denoise_result['content'], upload_file.filename)
+        ocr_content = ocr_result['ocrContent']
+        total_pages = ocr_result['total_pages'] # Lấy số trang
+
+        # Bước 5: Kiểm tra trùng lặp (UC-88)
+        if duplicate_check_enabled:
+            duplicate_result = await document_service.check_duplicates_by_content(
+                ocr_content=ocr_content, 
+                organization_id=user.organization_id,
+                user_id=user.id,
+                similarity_threshold=DUPLICATE_THRESHOLD
+            )
+            
+            if duplicate_result['isDuplicate']:
+                # Frontend (UC39_UploadPage.jsx) chờ một lỗi 409
+                return JSONResponse(status_code=409, content={
+                    "status": "409", 
+                    "message": "Phát hiện trùng lặp!",
+                    "duplicateData": duplicate_result['duplicateData'] # Gửi dữ liệu trùng lặp về
+                })
+
+        # Bước 6: Gợi ý Metadata (UC-73)
+        metadata_result = await document_service.suggest_metadata_from_content(
+            ocr_content, 
+            upload_file.filename
+        )
+
+        # Bước 7: Kiểm tra mâu thuẫn dữ liệu (UC-39/UC-73)
+        conflict_result = document_service.check_data_conflicts(
+            metadata_result['suggestedMetadata'].get('key_values', {})
+        )
+
+        # Bước 8: Giả lập Watermark (Chỉ để hiển thị)
+        watermark_result = await document_service.embed_watermark_preview(
+            denoise_result['content'], 
+            upload_file.filename
+        )
+
+        # --- Kết hợp kết quả trả về ---
+        full_api_response = {
+            "ocrContent": ocr_content,
+            "total_pages": total_pages, # <-- Trả về số trang
+            "suggestedMetadata": metadata_result['suggestedMetadata'],
+            "warnings": metadata_result.get('warnings', []),
+            "conflicts": conflict_result.get('conflicts', []),
+            "denoiseInfo": denoise_result.get('denoiseInfo', {}),
+            "watermarkInfo": watermark_result.get('watermarkInfo', {}),
+        }
+
+        # Trả về 200 OK với đầy đủ dữ liệu
+        return JSONResponse(status_code=200, content={
+            "status": "200",
+            "message": "Xử lý file thành công. Vui lòng xem lại thông tin.",
+            "data": full_api_response
+        })
+
+    except HTTPException as e:
+        # Bắt lại lỗi HTTP (ví dụ: 400, 403, 409)
+        logging.error(f"Lỗi HTTP trong Giai đoạn 1 (/process_upload): {e.detail}")
+        if e.status_code == 409:
+             return JSONResponse(status_code=409, content=e.detail) # Đảm bảo lỗi 409 được trả về
+        return JSONResponse(status_code=e.status_code, content={"status": str(e.status_code), "message": e.detail})
+        
+    except Exception as e:
+        error_info = traceback.format_exc()
+        logging.error(f"Lỗi máy chủ Giai đoạn 1 (/process_upload): {error_info}")
+        return JSONResponse(status_code=500, content={"status": "500",
+                                                      "message": "Đã xảy ra lỗi trong quá trình xử lý file: " + str(e)})
+
+# =========================================================================
+# API GIAI ĐOẠN 2: HOÀN TẤT (Finalize)
+# (Khớp với hàm `handleFinalize` của frontend UC39_UploadPage.jsx)
+# =========================================================================
+
+@router.post("/insert", tags=["Document"])
+async def finalize_document_upload( # Đổi tên hàm
+    request: Request, 
+    
+    # --- Dữ liệu file ---
+    upload_file: UploadFile = File(...),
+    
+    # --- Dữ liệu metadata từ Form (Step 3) ---
+    title: str = Body(...),
+    category_id: int = Body(...),
+    tags: str = Body(None), # Frontend gửi "tag1, tag2"
+    access_type: str = Body(...), # Frontend gửi "private", "public", "paid"
+    confidentiality: str = Body(...), # Frontend gửi "PUBLIC", "INTERNAL", "LOCKED"
+    
+    # --- Dữ liệu ẩn (đã xử lý ở Giai đoạn 1) ---
+    ocr_content: str = Body(None), # Nội dung text (nếu có)
+    total_pages: int = Body(1), # Số trang (đã đếm)
+    key_values_json: str = Body("{}"), # JSON string của key_values
+    summary: str = Body(None), # Tóm tắt (nếu có)
+    description: str = Body(None) # (Giữ lại trường description gốc)
+):
+    """
+    API Giai đoạn 2 (UC-39):
+    Thực hiện các bước cuối cùng (Watermark, Lưu trữ, Auto-Route)
+    sau khi người dùng đã xác nhận metadata.
+    """
+    try:
+        # Bước 1: Kiểm tra quyền (RBAC: documents:create)
+        # user_id = request.scope['user_id']
+        user_id = 1 # TẠM THỜI HARDCODE ĐỂ TEST
         user = document_service.get_user_by_id(user_id)
         
+        # (Kiểm tra RBAC và ABAC cho danh mục)
         if not user.is_organization_manager and not user.is_dept_manager:
             return JSONResponse(status_code=403,
-                                content={"status": "403", "message": "Bạn không có quyền thêm tài liệu"})
-
+                                content={"status": "403", "message": "Bạn không có quyền thêm tài liệu (thiếu 'documents:create')"})
+        
         category = document_service.get_category_by_id(category_id)
         if category.organization_id != user.organization_id:
             return JSONResponse(status_code=403, content={"status": "403",
@@ -63,59 +241,126 @@ async def process_document(request: Request, upload_file: UploadFile,
         elif not user.is_organization_manager and category.department_id != user.dept_id:
             return JSONResponse(status_code=403, content={"status": "403",
                                                           "message": "Bạn không có quyền thêm tài liệu vào danh mục này"})
-
-        print("00000000000000000000")   
-        document_service.check_access_type(access_type, organization_id, dept_id)
         
-        print("123123123123123123")        
+        # Kiểm tra định dạng file và kích thước (≤50MB)
+        file_size = upload_file.file.seek(0, 2)
+        if file_size > 50 * 1024 * 1024:
+             return JSONResponse(status_code=400, content={"status": "400", "message": "Lỗi: Kích thước file vượt quá 50MB."})
+        
+        allowed_types = ['application/pdf', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document', 'image/jpeg', 'image/png', 'image/tiff', 'video/mp4', 'audio/mpeg', 'video/x-msvideo', 'audio/wav']
+        file_mime_type, _ = mimetypes.guess_type(upload_file.filename)
+        
+        if file_mime_type not in allowed_types:
+             return JSONResponse(status_code=400, content={"status": "400", "message": f"Định dạng file {file_mime_type} không được hỗ trợ."})
 
+        await upload_file.seek(0)
+
+        # Kiểm tra trùng lặp TÊN FILE (vẫn nên giữ)
         unique_filename = document_service.check_duplicate_document(upload_file.filename, category_id)
-        print("444444444444444444444",upload_file.filename)   
-        storage_capacity, storage_unit = document_service.process_file(upload_file, user_id)
-        print("5555555555555555555555555555555")   
-        # file_id, file_path, local_file_path = document_service.upload_file_to_drive(upload_file, unique_filename)
-        file_id = "DUMMY_FILE_ID_FOR_TESTING"
-        file_path = "DUMMY_FILE_PATH_FOR_TESTING"
-        local_file_path = f"/app/file/{unique_filename}"
         
-        print("6666666666666666666666666666666")   
+        # Kiểm tra dung lượng lưu trữ (vẫn giữ)
+        storage_capacity, storage_unit = document_service.process_file(upload_file, user_id)
+        
+        # Bước 3.2: Nhúng Watermark (UC-39)
+        file_content = await upload_file.read()
+        final_file_content = await document_service.embed_watermark_final(
+            file_content, 
+            upload_file.filename,
+            confidentiality
+        )
 
-        allowed_image_extensions = ['png', 'jpg', 'jpeg', 'webp']
-
+        # Upload file đã có watermark
+        file_id, file_path, local_file_path = document_service.upload_file_to_drive(
+            final_file_content, 
+            unique_filename
+        )
+        
+        # Xử lý Photo ID cho ảnh
         file_extension = upload_file.filename.split('.')[-1].lower()
-        upload_file.file.seek(0)
-        file_content = await upload_file.read()  # Read the file content once
-
+        allowed_image_extensions = ['png', 'jpg', 'jpeg', 'webp']
+        photo_id = None
         if file_extension in allowed_image_extensions:
-            logging.debug(f"File content type: {upload_file.content_type}")
-            logging.debug(f"Image content length: {len(file_content)}")
-            photo_id = base64.b64encode(file_content).decode('utf-8')
-        else:
-            photo_id = None
+            photo_id = base64.b64encode(final_file_content).decode('utf-8')
 
-        inserted_document = await insert_document(unique_filename, user, category_id, description,
-                                                  1, unique_filename.split(".")[-1], file_id, file_path,
-                                                  storage_capacity, storage_unit, access_type, organization_id, dept_id,
-                                                  photo_id)
+        # --- Xây dựng metadata object đầy đủ ---
+        final_metadata = {
+            "title": title,
+            "category_id": category_id,
+            "tags": tags.split(',') if tags else [],
+            "access_type": access_type,
+            "confidentiality": confidentiality,
+            "description": description,
+            "ocrContent": ocr_content,
+            "summary": summary,
+            "key_values": json.loads(key_values_json)
+        }
+
+        # Bước 5: Lưu trữ và tạo bản ghi (status=DRAFT, version=1.0)
+        inserted_document = await document_service.insert_document(
+            filename=unique_filename,
+            user=user,
+            category_id=category_id,
+            description=description, # (Trường description gốc)
+            file_type=file_extension,
+            file_id=file_id,
+            file_path=file_path,
+            storage_capacity=storage_capacity,
+            storage_unit=storage_unit,
+            photo_id=photo_id,
+            # --- Các trường mới từ UC-39/Model ---
+            final_metadata=final_metadata,
+            status_str="DRAFT", # UC-39 yêu cầu
+            version="1.0",  # UC-39 yêu cầu
+            total_pages=total_pages # Đã lấy từ Giai đoạn 1
+        )
+        
         session = SessionLocal()
         inserted_document = session.merge(inserted_document)
+        session.close()
 
+        # (Lưu file upload vào DB - cho background processing nếu cần)
+        # (Hàm này có thể bị xóa nếu file đã xử lý xong)
         await insert_file_upload(inserted_document.id, user_id, local_file_path)
 
-        content = f"Dữ liệu {unique_filename} đã được thêm thành công vào hệ thống, chúng tôi sẽ tiến hành xử lý dữ liệu và thông báo với bạn khi hoàn thành"
-        title = f"Thêm dữ liệu {unique_filename} thành công"
+        # Bước 6: Tự động luân chuyển (UC-84)
+        auto_route_info = await document_service.trigger_auto_route(
+            inserted_document, 
+            final_metadata,
+            user
+        )
 
-        #await send_notification(title, content, user_id, inserted_document.id)
+        # Bước 7: Thiết lập quyền truy cập (UC-85/86)
+        public_link = None
+        if access_type == 'public':
+            public_link = await document_service.save_public_link(inserted_document.id, user_id)
+        # (Logic 'paid' (UC-85) đã được xử lý bởi cờ `is_paid=True` trong `insert_document`)
 
-        serialized_document = document_to_dict(inserted_document)
-        return JSONResponse(status_code=200, content={"status": "200", "message": "Tài liệu được tạo thành công",
-                                                      "data": serialized_document})
+        # Bước 8: Hiển thị kết quả (Khớp với Step4_Result)
+        # (Sử dụng hàm serialize_document để lấy thông tin đầy đủ)
+        serialized_document = document_service.serialize_document(inserted_document)
+        
+        # Cập nhật các trường trả về (model gốc không có, nên ta tự thêm)
+        serialized_document.update({
+            "doc_id": inserted_document.id,
+            "version": inserted_document.version,
+            "status": auto_route_info.get("triggered", False)
+                      and "PROCESSING_WORKFLOW" 
+                      or "DRAFT", # Phản ánh đúng trạng thái sau auto-route
+            "public_link": public_link
+        })
+
+        return JSONResponse(status_code=200, content={
+            "status": "200", 
+            "message": "Hoàn tất thành công!",
+            "document": serialized_document,
+            "autoRouteInfo": auto_route_info # Trả về thông tin auto-route
+        })
+        
     except Exception as e:
         error_info = traceback.format_exc()
-        logging.error(f"Chi tiết lỗi: {error_info}")
+        logging.error(f"Lỗi máy chủ Giai đoạn 2 (/insert): {error_info}")
         return JSONResponse(status_code=500, content={"status": "500",
-                                                      "message": "Đã xảy ra lỗi trong quá trình xử lý tài liệu: " + error_info})
-
+                                                      "message": "Đã xảy ra lỗi trong quá trình hoàn tất tài liệu: " + str(e)})
 
 @router.post("/send_notification")
 async def send_notification(title: str, content: str, user_id: int, doc_id: int):
