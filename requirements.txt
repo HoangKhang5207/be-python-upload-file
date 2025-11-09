@@ -83,5 +83,5 @@ opencv-python~=4.10.0.84
 python-magic-bin
 opencv-python-headless==4.5.5.64 
 Pillow==9.5.0
-odfpy==1.4.2
+odfpy==1.4.1
 lxml==4.9.4
