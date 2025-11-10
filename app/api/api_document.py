@@ -243,8 +243,10 @@ async def finalize_document_upload( # Đổi tên hàm
                                                           "message": "Bạn không có quyền thêm tài liệu vào danh mục này"})
         
         # Kiểm tra định dạng file và kích thước (≤50MB)
-        file_size = upload_file.file.seek(0, 2)
-        if file_size > 50 * 1024 * 1024:
+        upload_file.file.seek(0, 2)
+        file_size = upload_file.file.tell()
+        upload_file.file.seek(0)
+        if file_size > MAX_FILE_SIZE_BYTES:
              return JSONResponse(status_code=400, content={"status": "400", "message": "Lỗi: Kích thước file vượt quá 50MB."})
         
         allowed_types = ['application/pdf', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document', 'image/jpeg', 'image/png', 'image/tiff', 'video/mp4', 'audio/mpeg', 'video/x-msvideo', 'audio/wav']

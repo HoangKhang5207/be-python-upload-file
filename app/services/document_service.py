@@ -85,6 +85,30 @@ openai.api_key = settings.OPENAI_API_KEY_EMBEDDING
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
+def ensure_meta_data_index_exists():
+    """Ensure meta_data index exists in Elasticsearch"""
+    try:
+        if not client.indices.exists(index="meta_data"):
+            client.indices.create(
+                index="meta_data",
+                body={
+                    "mappings": {
+                        "properties": {
+                            "document_id": {"type": "integer"},
+                            "category_id": {"type": "integer"},
+                            "document_number": {"type": "text"},
+                            "issuing_authority": {"type": "text"},
+                            "date_of_issuance": {"type": "text"},
+                            "signature": {"type": "text"},
+                            "agency_address": {"type": "text"}
+                        }
+                    }
+                }
+            )
+            logging.info("Created meta_data index in Elasticsearch")
+    except Exception as e:
+        logging.error(f"Error ensuring meta_data index exists: {e}")
+
 def get_mime_type(file_content: bytes) -> str:
     """Sử dụng 'magic' để xác định MIME type một cách an toàn từ nội dung byte."""
     try:
@@ -829,9 +853,25 @@ def split_text_into_chunks(text):
 # *** THAY THẾ HÀM NÀY (Thêm organization_id) ***
 def create_embeddings_and_store(texts: str, filename: str, category_id: int, document_id: int, type_doc: str, organization_id: int):
     print("Starting create_embeddings_and_store")
+    # Xử lý trường hợp texts là None hoặc không phải là iterable
+    if texts is None:
+        logging.warning(f"texts is None for document {document_id}, skipping embeddings creation")
+        return False
+    
     text = ""
-    for i in texts:
-        text += i
+    if isinstance(texts, str):
+        text = texts
+    elif isinstance(texts, (list, tuple)):
+        for i in texts:
+            if i:
+                text += str(i)
+    else:
+        try:
+            for i in texts:
+                text += str(i)
+        except TypeError:
+            logging.warning(f"texts is not iterable for document {document_id}, skipping embeddings creation")
+            return False
 
     sentences = text.replace("\n", " ")
     data = sent_tokenizer.sentences_from_text(sentences)
@@ -1277,6 +1317,9 @@ def delete_sentences_in_elasticsearch(document_id: int, user_id: int):
     es = Elasticsearch([elasticsearch_url])
     query = {"query": {"match": {"document_id": document_id}}}
 
+    # Ensure meta_data index exists
+    ensure_meta_data_index_exists()
+    
     # Check if metadata exists
     meta_query = {
         "query": {
@@ -1325,6 +1368,9 @@ def serialize_document(document):
 
     try:
         if document.type in ["pdf", "docx"]:
+            # Ensure meta_data index exists
+            ensure_meta_data_index_exists()
+            
             es_query = {
                 "query": {
                     "term": {
@@ -2364,6 +2410,9 @@ def process_upload(doc_id: int, local_file_path: str, user_id: int):
                     session.commit()
 
                     # Tạo prompt cho OpenAI
+                    # Kiểm tra text không None trước khi sử dụng
+                    text_content = text[:1000] if text else ""
+                    
                     prompt = (
                         "Trích xuất thông tin sau từ nội dung tài liệu và trả về dưới dạng JSON:\n\n"
                         "1. document_number (ví dụ: XX/AAAA/TT-ABC, XX/AAAA/NĐ-CP, ...) là giá trị của 'số:' hoặc 'luật số:' trong đó XX đại diện cho số serial của thông tư trong năm, AAAA là năm phát hành, và TT-ABC là viết tắt của cơ quan phát hành.\n"
@@ -2374,7 +2423,7 @@ def process_upload(doc_id: int, local_file_path: str, user_id: int):
                         "Vui lòng đảm bảo document_number được định dạng là XX/AAAA/TT-ABC hoặc XX/AAAA/NĐ-CP.\n\n"
                         "Nếu bất kỳ trường nào không có trong tài liệu, hãy trả về chúng là null.\n\n"
                         "Nội dung tài liệu:\n"
-                        f"{text[:1000]}"
+                        f"{text_content}"
                     )
 
                     response_text = call_openai(prompt)
@@ -2391,6 +2440,9 @@ def process_upload(doc_id: int, local_file_path: str, user_id: int):
 
                             if any(generated_data[field] for field in
                                    ['document_number', 'issuing_authority', 'date_of_issuance']):
+                                # Ensure meta_data index exists
+                                ensure_meta_data_index_exists()
+                                
                                 request = {
                                     "_op_type": "index",
                                     "_index": "meta_data",
@@ -2410,8 +2462,10 @@ def process_upload(doc_id: int, local_file_path: str, user_id: int):
                         except json.JSONDecodeError as e:
                             print(f"Không thể phân tích JSON: {e}")
 
-                    if create_embeddings_and_store(text, document.title, document.category_id, document.id,
-                                                   file_format):
+                    # organization_id mặc định là 1 để test
+                    # Kiểm tra text không None trước khi tạo embeddings
+                    if text and create_embeddings_and_store(text, document.title, document.category_id, document.id,
+                                                             file_format, 1):
                         print("Cập nhật nội dung tài liệu thành công")
                         session.execute(delete(FileUpload).where(FileUpload.document_id == doc_id))
                         session.commit()
@@ -2517,6 +2571,9 @@ def process_upload_by_openai_test(doc_id: int, local_file_path: str, user_id: in
 
                         # if any(generated_data[field] for field in
                         #        ['document_number', 'issuing_authority', 'date_of_issuance']):
+                        # Ensure meta_data index exists
+                        ensure_meta_data_index_exists()
+                        
                         request = {
                             "_op_type": "index",
                             "_index": "meta_data",
@@ -2536,8 +2593,9 @@ def process_upload_by_openai_test(doc_id: int, local_file_path: str, user_id: in
                     except json.JSONDecodeError as e:
                         print(f"Không thể phân tích JSON: {e}")
 
-                if create_embeddings_and_store_openai(text, document.title, document.category_id, document.id,
-                                                      file_format, orgnization_id):
+                # Kiểm tra text không None trước khi tạo embeddings
+                if text and create_embeddings_and_store_openai(text, document.title, document.category_id, document.id,
+                                                                file_format, orgnization_id):
                     print("Cập nhật nội dung tài liệu thành công")
                     session.execute(delete(FileUpload).where(FileUpload.document_id == doc_id))
                     session.commit()
@@ -2577,9 +2635,25 @@ def process_upload_by_openai_test(doc_id: int, local_file_path: str, user_id: in
 # *** THAY THẾ HÀM NÀY (Thêm organization_id) ***
 def create_embeddings_and_store_openai(texts: str, filename: str, category_id: int, document_id: int, type_doc: str,
                                        orgnization_id: int):
+    # Xử lý trường hợp texts là None hoặc không phải là iterable
+    if texts is None:
+        logging.warning(f"texts is None for document {document_id}, skipping embeddings creation")
+        return False
+    
     text = ""
-    for i in texts:
-        text = text + i
+    if isinstance(texts, str):
+        text = texts
+    elif isinstance(texts, (list, tuple)):
+        for i in texts:
+            if i:
+                text += str(i)
+    else:
+        try:
+            for i in texts:
+                text += str(i)
+        except TypeError:
+            logging.warning(f"texts is not iterable for document {document_id}, skipping embeddings creation")
+            return False
 
     sentences = text.replace("\n", " ")
 
@@ -3263,6 +3337,9 @@ def calculate_ssim(image1: np.ndarray, image2: np.ndarray) -> float:
 def update_metadata(document_id, document_number=None, issuing_authority=None, date_of_issuance=None, signature=None,
                     agency_address=None):
     client = Elasticsearch([elasticsearch_url])
+
+    # Ensure meta_data index exists
+    ensure_meta_data_index_exists()
 
     query = {
         "query": {
