@@ -33,7 +33,7 @@ from starlette.responses import JSONResponse
 from reportlab.pdfgen import canvas # Cho Watermark PDF
 from reportlab.lib.pagesizes import letter
 from reportlab.lib import colors
-from reportlab.lib.units import ImageReader
+from reportlab.lib.units import inch
 
 import zipfile # Để đọc file .docx, .pptx, .xlsx, .odt
 import xml.etree.ElementTree as ET # (Fallback nếu lxml lỗi)
@@ -1011,9 +1011,9 @@ async def embed_watermark_final(file_content: bytes, filename: str, confidential
                 # UC-39: Nhúng logo INNOTECH
                 logo_path = os.path.join(os.path.dirname(__file__), '..', 'logo-teal.png')
                 if os.path.exists(logo_path):
-                    logo = ImageReader(logo_path)
+                    # reportlab có thể nhận đường dẫn file trực tiếp
                     # Vị trí góc dưới bên phải
-                    c.drawImage(logo, letter[0] - 1.2*inch, 0.5*inch, width=1*inch, preserveAspectRatio=True, mask='auto', anchor='c')
+                    c.drawImage(logo_path, letter[0] - 1.2*inch, 0.5*inch, width=1*inch, preserveAspectRatio=True, mask='auto', anchor='c')
                 else:
                     logging.warning(f"Không tìm thấy file logo tại {logo_path}")
                     
