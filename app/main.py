@@ -9,6 +9,9 @@ from app.core.config import settings
 from app.helpers.exception_handler import CustomException, http_exception_handler
 from app.middleware.auth_middleware import ValidateTokenMiddleware
 from app.scheduler import scheduler_cron, schedule_delete_old_documents, schedule_file_uploads_processing
+from app.db.engine_default import Base, engine
+# Import models to ensure they are registered with SQLAlchemy metadata before creating tables
+from app.models import models  # noqa: F401
 
 app = FastAPI(
     title=settings.PROJECT_NAME,
@@ -45,6 +48,8 @@ app.include_router(router, prefix=settings.API_PREFIX)
 
 @app.on_event("startup")
 async def start_scheduler():
+    # Ensure database tables are created before scheduler jobs run
+    Base.metadata.create_all(bind=engine)
     await schedule_delete_old_documents()
     await schedule_file_uploads_processing()
     scheduler_cron.start()

@@ -97,3 +97,6 @@ Thumbs.db
 docker/
 docker-compose.override.yml
 volumes/
+
+# Documents
+.documents/
