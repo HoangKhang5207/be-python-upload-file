@@ -11,6 +11,7 @@ import PyPDF2 # Cho Watermark PDF
 from io import BytesIO
 from typing import Union
 import openai
+from openai.error import OpenAIError
 from fastapi import UploadFile, HTTPException
 from google.api_core.exceptions import PermissionDenied
 from nltk import PunktSentenceTokenizer
@@ -60,6 +61,7 @@ from elasticsearch import Elasticsearch
 from docx import Document as DocxDocument
 import re
 from elasticsearch.helpers import bulk, BulkIndexError, scan
+from elasticsearch.exceptions import NotFoundError
 import string
 from datetime import datetime, date, timedelta
 import magic # Để kiểm tra mime type chính xác hơn
@@ -245,7 +247,11 @@ async def check_duplicates_by_content(
         # 2. Vector hóa nội dung mới
         if is_openai_org:
             headers = { "Authorization": f"Bearer {settings.OPENAI_API_KEY_EMBEDDING}" }
-            query_vector = get_openai_embeddings_to_search([ocr_content], headers)[0]
+            embeddings = get_openai_embeddings_to_search([ocr_content], headers)
+            if not embeddings:
+                logging.error("OpenAI embedding service returned no vectors; skip duplicate check with fallback result.")
+                return {"isDuplicate": False}
+            query_vector = embeddings[0]
         else:
             query_vector = embed_str([tokenize(ocr_content)])[0]
             
@@ -1603,6 +1609,9 @@ def search(query, client, category_id=None, type_doc=None, user_id=None):
             "Content-Type": "application/json"
         }
         query_embeddings = get_openai_embeddings_to_search([query], headers)
+        if not query_embeddings:
+            logging.error("OpenAI embedding service returned no vectors; skipping search and returning empty result.")
+            return [], []
         query_vector = query_embeddings[0]
     else:
         index = "demo_cau"
@@ -1631,19 +1640,29 @@ def search(query, client, category_id=None, type_doc=None, user_id=None):
     if type_doc is not None:
         script_query["bool"]["filter"].append({"term": {"type": type_doc}})
 
-    response = client.search(
-        index=[index],
-        body={
-            "query": script_query,
-            "_source": {
-                "includes": ["id", "title", "doc_id", "document_id"]
+    try:
+        response = client.search(
+            index=[index],
+            body={
+                "query": script_query,
+                "_source": {
+                    "includes": ["id", "title", "doc_id", "document_id"]
+                },
+                "sort": [
+                    {"_score": {"order": "desc"}}
+                ]
             },
-            "sort": [
-                {"_score": {"order": "desc"}}
-            ]
-        },
-        ignore=[400]
-    )
+            ignore=[400]
+        )
+    except NotFoundError:
+        # Index không tồn tại, trả về kết quả rỗng
+        logging.warning(f"Index '{index}' không tồn tại trong Elasticsearch. Trả về kết quả rỗng.")
+        return [], []
+    except Exception as e:
+        # Xử lý các lỗi khác
+        logging.error(f"Lỗi khi tìm kiếm trong Elasticsearch: {e}")
+        return [], []
+
     result = []
 
     log = response["hits"]["hits"]
@@ -1876,9 +1895,10 @@ def find_custom_metadata(id_list, start, end, user_id):
             ).offset(start).limit(end).all()
             result.extend(output)
 
+        # Đếm tổng số bản ghi phù hợp cho toàn bộ id_list
         count_query = session.query(combined_docs).filter(
             and_(
-                combined_docs.c.documents_id == id,
+                combined_docs.c.documents_id.in_(id_list),
                 combined_docs.c.documents_status == 1
             )
         )
@@ -2039,11 +2059,14 @@ def search_documents(question: str, client, category_id: Union[str], type_doc: U
 
     try:
         response = chat_with_gpt(question_gpt)
-        if 'error' in response.lower():
+        if response is None:
+            normalized_question = question
+        elif isinstance(response, str) and 'error' in response.lower():
             normalized_question = question
         else:
             normalized_question = response.strip('"')
-    except openai.BadRequestError:
+    except (requests.exceptions.RequestException, Exception) as e:
+        logging.error(f"Error calling chat_with_gpt: {e}")
         normalized_question = question
 
     try:
@@ -3157,8 +3180,8 @@ def get_openai_embeddings_check_plagiarism(texts, model="text-embedding-ada-002"
                 model=model
             )
             embeddings.extend([normalize_vector(np.array(embedding['embedding'])) for embedding in response['data']])
-        except openai.error.APIError as e:
-            logger.error(f"OpenAI API error: {e}")
+        except (OpenAIError, Exception) as e:
+            logger.error(f"OpenAI embedding error: {e}")
             return []
     return embeddings
 

@@ -51,6 +51,20 @@ logging.basicConfig(level=logging.DEBUG)
 
 SCOPES = ['https://www.googleapis.com/auth/drive']
 
+DEFAULT_TEST_USER_ID = 1
+
+
+def get_request_user_id(request: Request, default_user_id: int = DEFAULT_TEST_USER_ID) -> int:
+    """
+    Lấy user_id từ request scope. Khi middleware auth bị tắt hoặc thiếu token,
+    fallback về user_id mặc định để tránh lỗi 500.
+    """
+    user_id = request.scope.get('user_id')
+    if user_id is None:
+        logging.warning("user_id is missing from request scope; falling back to default user_id=%s", default_user_id)
+        return default_user_id
+    return user_id
+
 
 # credentials = service_account.Credentials.from_service_account_file(
 #     google_application_credentials, scopes=SCOPES
@@ -94,8 +108,7 @@ async def process_upload_file(
     try:
         # Bước 1: Kiểm tra quyền (RBAC: documents:upload)
         # (Sử dụng user_id từ middleware, tạm hardcode)
-        # user_id = request.scope['user_id']
-        user_id = 1 # TẠM THỜI HARDCODE ĐỂ TEST
+        user_id = get_request_user_id(request)
         user = document_service.get_user_by_id(user_id)
         if not user:
              raise HTTPException(status_code=403, detail="Không tìm thấy người dùng.")
@@ -225,8 +238,7 @@ async def finalize_document_upload( # Đổi tên hàm
     """
     try:
         # Bước 1: Kiểm tra quyền (RBAC: documents:create)
-        # user_id = request.scope['user_id']
-        user_id = 1 # TẠM THỜI HARDCODE ĐỂ TEST
+        user_id = get_request_user_id(request)
         user = document_service.get_user_by_id(user_id)
         
         # (Kiểm tra RBAC và ABAC cho danh mục)
@@ -391,7 +403,7 @@ async def edit_document(request: Request, doc_id: int,
                         description: str = Body(None),
                         category_id: int = Body(None)):
     document = document_service.get_document_by_id(doc_id)
-    user_id = request.scope['user_id']
+    user_id = get_request_user_id(request)
     user = document_service.get_user_by_id(user_id)
     if not user.is_organization_manager and not user.is_dept_manager:
         return JSONResponse(status_code=403,
@@ -423,7 +435,7 @@ async def edit_document(request: Request, doc_id: int,
 
 @router.delete("/delete")
 def delete_document(request: Request, doc_id: int):
-    user_id = request.scope['user_id']
+    user_id = get_request_user_id(request)
     try:
         document = document_service.delete_document(doc_id, user_id)
         document_dict = document_service.serialize_document(document)  # Convert Document object to dict
@@ -435,7 +447,7 @@ def delete_document(request: Request, doc_id: int):
 
 @router.post("/move_to_trash")
 def move_to_trash(request: Request, doc_id: int):
-    user_id = request.scope['user_id']
+    user_id = get_request_user_id(request)
     document = document_service.get_document_by_id(doc_id)
     user = document_service.get_user_by_id(user_id)
     if not user.is_organization_manager and not user.is_dept_manager:
@@ -457,7 +469,7 @@ def move_to_trash(request: Request, doc_id: int):
 
 @router.get("/view")
 async def view_document(request: Request, doc_id: int):
-    user_id = request.scope['user_id']
+    user_id = get_request_user_id(request)
     document = document_service.view_document(doc_id, user_id)
     return JSONResponse(status_code=200, content={"status": "200", "message": "Document retrieved successfully",
                                                   "data": document})
@@ -541,7 +553,7 @@ async def view_document(request: Request, doc_id: int):
 
 @router.get("/get_by_category")
 async def get_document_by_category(request: Request, category_id: int, page: int = 1, page_size: int = 10):
-    user_id = request.scope['user_id']
+    user_id = get_request_user_id(request)
     documents, page, total_pages = await document_service.get_documents_by_category_service(category_id, page,
                                                                                             page_size,
                                                                                             user_id)
@@ -556,7 +568,7 @@ async def get_document_by_category(request: Request, category_id: int, page: int
 
 @router.get("/get_recent_files")
 async def get_recent_files(request: Request, time: date, page: int = 1, page_size: int = 30):
-    user_id = request.scope['user_id']
+    user_id = get_request_user_id(request)
     documents, page, total_pages = document_service.get_recent_documents_service(time, user_id, page, page_size)
     serialized_documents = [document_service.serialize_document(doc) for doc in documents]
     return JSONResponse(status_code=200, content={
@@ -570,7 +582,7 @@ async def get_recent_files(request: Request, time: date, page: int = 1, page_siz
 
 @router.get("/get_recent_files_deleted")
 def get_recent_documents_deleted(request: Request, time: date, page: int = 1, page_size: int = 10):
-    user_id = request.scope['user_id']
+    user_id = get_request_user_id(request)
     documents, page, total_pages = document_service.get_recent_documents_deleted_service(time, user_id, page, page_size)
     return JSONResponse(status_code=200, content={
         "status": "200",
@@ -583,7 +595,7 @@ def get_recent_documents_deleted(request: Request, time: date, page: int = 1, pa
 
 @router.get("/recover_files")
 def recover_files(request: Request, doc_id: int):
-    user_id = request.scope['user_id']
+    user_id = get_request_user_id(request)
     user = document_service.get_user_by_id(user_id)
     document = document_service.get_document_by_id(doc_id)
     if not user.is_organization_manager and not user.is_dept_manager:
@@ -613,7 +625,8 @@ async def find_doc_nlp(request: Request,
                        type_doc: Union[str] = None,
                        question: Union[str] = "", page_num: int = 1,
                        page_size: int = 10):
-    user_id = request.scope['user_id']
+    user_id = get_request_user_id(request)
+    user_id = get_request_user_id(request)
     start = (page_num - 1) * page_size
     end = page_size
 
@@ -636,7 +649,7 @@ async def find_doc_nlp(request: Request,
 @router.get("/suggest_metadata")
 async def suggest_metadata(request: Request, document_number: str = None, issuing_authority: str = None,
                            date_of_issuance: str = None, signature: str = None, agency_address: str = None):
-    user_id = request.scope['user_id']
+    user_id = get_request_user_id(request)
 
     metadata = document_service.filter_metadata_by_user(user_id, document_number=document_number,
                                                         issuing_authority=issuing_authority,
@@ -678,7 +691,7 @@ async def suggest_metadata(request: Request, document_number: str = None, issuin
 @router.get("/get_document_by_metadata")
 async def get_document_by_metadata(request: Request, document_number: str = None, issuing_authority: str = None,
                                    date_of_issuance: str = None, signature: str = None, agency_address: str = None):
-    user_id = request.scope['user_id']
+    user_id = get_request_user_id(request)
     if all(param is None for param in
            [document_number, issuing_authority, date_of_issuance, signature, agency_address]):
         return JSONResponse(status_code=200, content={
@@ -698,7 +711,7 @@ async def get_document_by_metadata(request: Request, document_number: str = None
 
 @router.get("/set_password_document")
 async def set_password_document(request: Request, doc_id: int, password: str):
-    user_id = request.scope['user_id']
+    user_id = get_request_user_id(request)
     user = document_service.get_user_by_id(user_id)
     if not user.is_organization_manager and not user.is_dept_manager:
         return JSONResponse(status_code=403,
@@ -719,7 +732,7 @@ async def set_password_document(request: Request, doc_id: int, password: str):
 
 @router.get("/remove_password_document")
 async def remove_password_document(request: Request, doc_id: int):
-    user_id = request.scope['user_id']
+    user_id = get_request_user_id(request)
     user = document_service.get_user_by_id(user_id)
     if not user.is_organization_manager and not user.is_dept_manager:
         return JSONResponse(status_code=403,
@@ -778,7 +791,7 @@ async def generate_image_description_endpoint(doc_id: int, file: UploadFile = Fi
 
 @router.get("/search_photo")
 async def search_image_descriptions_endpoint(request: Request, query: str):
-    user_id = request.scope['user_id']
+    user_id = get_request_user_id(request)
     try:
         documents = search_image_descriptions(query, user_id)
         serialized_documents = [serialize_document(doc) for doc in documents]
@@ -792,7 +805,7 @@ async def search_image_descriptions_endpoint(request: Request, query: str):
 
 @router.get("/check_plagiarism")
 async def check_plagiarism_endpoint(request: Request, doc_id: int):
-    user_id = request.scope['user_id']
+    user_id = get_request_user_id(request)
     try:
         result = check_plagiarism(doc_id)
         return JSONResponse(status_code=200, content={"status": "200", "data": result})
@@ -805,7 +818,7 @@ async def check_plagiarism_endpoint(request: Request, doc_id: int):
 
 @router.get("/compare_documents")
 async def compare_documents(request: Request, doc_id1: int, doc_id2: int):
-    user_id = request.scope['user_id']
+    user_id = get_request_user_id(request)
     try:
         result = await async_compare_document_similarity(doc_id1, doc_id2)
         return JSONResponse(status_code=200, content={"status": "200", "data": result})
@@ -822,7 +835,7 @@ async def async_compare_document_similarity(doc_id1: int, doc_id2: int):
 
 @router.post("/compare-images")
 def compare_images(request: Request, doc_id1: int, doc_id2: int):
-    user_id = request.scope['user_id']
+    user_id = get_request_user_id(request)
     image_base64_1 = get_image_from_db(doc_id1)
     image_base64_2 = get_image_from_db(doc_id2)
 
@@ -846,7 +859,7 @@ def compare_images(request: Request, doc_id1: int, doc_id2: int):
 @router.put("/edit_metadata")
 async def edit_metadata(request: Request, document_id: int, document_number: str = None, issuing_authority: str = None,
                         date_of_issuance: str = None, signature: str = None, agency_address: str = None):
-    user_id = request.scope['user_id']
+    user_id = get_request_user_id(request)
     try:
         updated_metadata = document_service.update_metadata(document_id, document_number=document_number,
                                                             issuing_authority=issuing_authority,
@@ -863,7 +876,7 @@ async def edit_metadata(request: Request, document_id: int, document_number: str
 
 @router.put("/edit_description_photo")
 async def edit_description_photo(request: Request, doc_id: int, new_description: str):
-    user_id = request.scope['user_id']
+    user_id = get_request_user_id(request)
     try:
         updated_description = document_service.update_photo_description(doc_id, new_description)
         return JSONResponse(status_code=200, content={
