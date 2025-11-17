@@ -175,10 +175,28 @@ async def process_upload_file(
         )
 
         # --- Kết hợp kết quả trả về ---
+        # Áp dụng giá trị mặc định cho ocrContent nếu rỗng
+        ocr_content_final = ocr_content if ocr_content and ocr_content.strip() else "(Chưa có OCR để thực hiện)"
+        
+        # Áp dụng giá trị mặc định cho tags nếu rỗng
+        tags_final = metadata_result['suggestedMetadata'].get('tags', [])
+        if not tags_final:
+            tags_final = ["tag1", "tag2"]
+            
+        # Áp dụng giá trị mặc định cho key_values nếu rỗng
+        key_values_final = metadata_result['suggestedMetadata'].get('key_values', {})
+        if not key_values_final:
+            key_values_final = {"key1": "value1", "key2": "value2"}
+        
+        # Cập nhật suggestedMetadata với các giá trị key_values và tags đã xử lý
+        suggested_metadata = metadata_result['suggestedMetadata']
+        suggested_metadata['tags'] = tags_final
+        suggested_metadata['key_values'] = key_values_final
+        
         full_api_response = {
-            "ocrContent": ocr_content,
+            "ocrContent": ocr_content_final,
             "total_pages": total_pages, # <-- Trả về số trang
-            "suggestedMetadata": metadata_result['suggestedMetadata'],
+            "suggestedMetadata": suggested_metadata,
             "warnings": metadata_result.get('warnings', []),
             "conflicts": conflict_result.get('conflicts', []),
             "denoiseInfo": denoise_result.get('denoiseInfo', {}),
@@ -284,15 +302,25 @@ async def finalize_document_upload( # Đổi tên hàm
         )
 
         # Upload file đã có watermark
-        file_id, file_path, local_file_path = document_service.upload_file_to_drive(
-            final_file_content, 
-            unique_filename
-        )
+        # file_id, file_path, local_file_path = document_service.upload_file_to_drive(
+        #     final_file_content, 
+        #     unique_filename
+        # )
+        # Tạm thời disable upload to Google Drive do lỗi xác thực
+        file_id = ""  # Sử dụng chuỗi rỗng thay vì None
+        file_path = f"/local_storage/{unique_filename}"  # Đường dẫn giả lập
+        local_file_path = f"./uploaded_files/{unique_filename}"  # Đường dẫn cục bộ
+        
+        # Lưu file cục bộ thay vì upload lên Google Drive
+        import os
+        os.makedirs(os.path.dirname(local_file_path), exist_ok=True)
+        with open(local_file_path, 'wb') as f:
+            f.write(final_file_content)
         
         # Xử lý Photo ID cho ảnh
         file_extension = upload_file.filename.split('.')[-1].lower()
         allowed_image_extensions = ['png', 'jpg', 'jpeg', 'webp']
-        photo_id = None
+        photo_id = ""
         if file_extension in allowed_image_extensions:
             photo_id = base64.b64encode(final_file_content).decode('utf-8')
 
@@ -345,8 +373,9 @@ async def finalize_document_upload( # Đổi tên hàm
 
         # Bước 7: Thiết lập quyền truy cập (UC-85/86)
         public_link = None
-        if access_type == 'public':
-            public_link = await document_service.save_public_link(inserted_document.id, user_id)
+        # if access_type == 'public':
+        #     public_link = await document_service.save_public_link(inserted_document.id, user_id)
+        # Tạm thời disable public link do lỗi Google Drive
         # (Logic 'paid' (UC-85) đã được xử lý bởi cờ `is_paid=True` trong `insert_document`)
 
         # Bước 8: Hiển thị kết quả (Khớp với Step4_Result)
@@ -621,18 +650,24 @@ class RequestSearchBody(BaseModel):
 
 @router.get("/search")
 async def find_doc_nlp(request: Request,
-                       category_id: Union[str] = None,
-                       type_doc: Union[str] = None,
-                       question: Union[str] = "", page_num: int = 1,
+                       category_id: Union[str, None] = None,
+                       type_doc: Union[str, None] = None,
+                       question: Union[str, None] = "", page_num: int = 1,
                        page_size: int = 10):
     user_id = get_request_user_id(request)
     user_id = get_request_user_id(request)
     start = (page_num - 1) * page_size
     end = page_size
 
-    docs, total, total_pages, normalized_question = document_service.search_documents(question, client, category_id,
-                                                                                      type_doc, start, end,
-                                                                                      user_id)
+    # Xử lý giá trị None cho các tham số
+    question_str = question if question is not None else ""
+    category_id_str = category_id if category_id is not None else ""
+    type_doc_str = type_doc if type_doc is not None else ""
+    
+    docs, total, total_pages, normalized_question = document_service.search_documents(
+        question_str, client, category_id_str,
+        type_doc_str, start, end,
+        user_id)
     docs = [doc for doc in docs if doc['relevance_score'] is not None]
     docs = sorted(docs, key=lambda d: d['relevance_score'], reverse=True)
 
@@ -647,8 +682,12 @@ async def find_doc_nlp(request: Request,
 
 
 @router.get("/suggest_metadata")
-async def suggest_metadata(request: Request, document_number: str = None, issuing_authority: str = None,
-                           date_of_issuance: str = None, signature: str = None, agency_address: str = None):
+async def suggest_metadata(request: Request, 
+                          document_number: Union[str, None] = None, 
+                          issuing_authority: Union[str, None] = None,
+                          date_of_issuance: Union[str, None] = None, 
+                          signature: Union[str, None] = None, 
+                          agency_address: Union[str, None] = None):
     user_id = get_request_user_id(request)
 
     metadata = document_service.filter_metadata_by_user(user_id, document_number=document_number,
@@ -689,8 +728,12 @@ async def suggest_metadata(request: Request, document_number: str = None, issuin
 
 
 @router.get("/get_document_by_metadata")
-async def get_document_by_metadata(request: Request, document_number: str = None, issuing_authority: str = None,
-                                   date_of_issuance: str = None, signature: str = None, agency_address: str = None):
+async def get_document_by_metadata(request: Request, 
+                                  document_number: Union[str, None] = None, 
+                                  issuing_authority: Union[str, None] = None,
+                                  date_of_issuance: Union[str, None] = None, 
+                                  signature: Union[str, None] = None, 
+                                  agency_address: Union[str, None] = None):
     user_id = get_request_user_id(request)
     if all(param is None for param in
            [document_number, issuing_authority, date_of_issuance, signature, agency_address]):
@@ -857,8 +900,12 @@ def compare_images(request: Request, doc_id1: int, doc_id2: int):
 
 
 @router.put("/edit_metadata")
-async def edit_metadata(request: Request, document_id: int, document_number: str = None, issuing_authority: str = None,
-                        date_of_issuance: str = None, signature: str = None, agency_address: str = None):
+async def edit_metadata(request: Request, document_id: int, 
+                       document_number: Union[str, None] = None, 
+                       issuing_authority: Union[str, None] = None,
+                       date_of_issuance: Union[str, None] = None, 
+                       signature: Union[str, None] = None, 
+                       agency_address: Union[str, None] = None):
     user_id = get_request_user_id(request)
     try:
         updated_metadata = document_service.update_metadata(document_id, document_number=document_number,
