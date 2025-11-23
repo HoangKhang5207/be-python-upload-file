@@ -16,13 +16,13 @@ from transformers import RobertaModel
 from app.core.config import settings
 from app.db.base import SessionLocal
 from app.db.engine_default import session_scope
+import io
 
 from app.services import document_service
 from elasticsearch import Elasticsearch
 from app.services.document_service import (insert_document, update_category_in_elasticsearch, document_to_dict,
                                            insert_file_upload, generate_image_description, search_image_descriptions,
                                            serialize_document, check_plagiarism, compare_document_similarity,
-                                           get_image_from_db, create_image_from_base64, calculate_ssim,
                                            get_user_by_id, get_category_by_id, check_duplicate_document, process_file,
                                            
                                         get_mime_type,
@@ -38,6 +38,17 @@ from app.services.document_service import (insert_document, update_category_in_e
                                         trigger_auto_route,
                                         save_public_link
                                            )
+
+# Import helper functions from utils
+from app.utils.file_utils import (
+    is_file_size_exceeded,
+    is_mime_type_allowed, 
+    classify_file_type,
+    MAX_FILE_SIZE_MB,
+    MAX_FILE_SIZE_BYTES,
+    ALLOWED_MIME_TYPES,
+    DUPLICATE_THRESHOLD
+)
 
 router = APIRouter()
 model = settings.MODEL
@@ -94,7 +105,7 @@ DUPLICATE_THRESHOLD = 0.30
 # (Khớp với hàm `processFile` của frontend UC39_UploadPage.jsx)
 # =========================================================================
 
-@router.post("/process_upload", tags=["Document"])
+@router.post("/process_upload")
 async def process_upload_file(
     request: Request,
     upload_file: UploadFile = File(...),
@@ -122,23 +133,31 @@ async def process_upload_file(
         await upload_file.seek(0) # Reset con trỏ file
 
         # Bước 2: Kiểm tra định dạng và kích thước (UC-39)
-        if len(file_content) > MAX_FILE_SIZE_BYTES:
+        if is_file_size_exceeded(len(file_content)):
              raise HTTPException(status_code=400, detail=f"400: Kích thước file vượt quá {MAX_FILE_SIZE_MB}MB.")
         
         file_mime_type = document_service.get_mime_type(file_content)
-        if file_mime_type not in ALLOWED_MIME_TYPES:
+        if not is_mime_type_allowed(file_mime_type):
              raise HTTPException(status_code=400, detail=f"400: Định dạng file {file_mime_type} không được hỗ trợ.")
 
         # --- Bắt đầu luồng xử lý (Step 2 - 4) ---
+        
+        # Bước 3: Phân loại loại file
+        file_type = classify_file_type(file_content, file_mime_type)
 
-        # Bước 3: Khử nhiễu (UC-39 Denoise)
-        denoise_result = await document_service.denoise_image(file_content, upload_file.filename)
-
-        # Bước 4: OCR & Đếm trang (UC-87)
-        # (Sử dụng content đã khử nhiễu)
-        ocr_result = await document_service.perform_ocr(denoise_result['content'], upload_file.filename)
-        ocr_content = ocr_result['ocrContent']
-        total_pages = ocr_result['total_pages'] # Lấy số trang
+        # Bước 4: Khử nhiễu & OCR (chỉ với image)
+        if file_type == "image":
+            # Khử nhiễu (UC-39 Denoise)
+            denoise_result = await document_service.denoise_image(file_content, upload_file.filename)
+            
+            # OCR & Đếm trang (UC-87)
+            ocr_result = await document_service.perform_ocr(denoise_result['content'], upload_file.filename)
+            ocr_content = ocr_result['ocrContent']
+            total_pages = ocr_result['total_pages']
+        else:
+            # Bỏ qua Khử nhiễu và OCR cho non-image
+            ocr_content = "(Nội dung văn bản)"
+            total_pages = 1
 
         # Bước 5: Kiểm tra trùng lặp (UC-88)
         if duplicate_check_enabled:
@@ -169,10 +188,17 @@ async def process_upload_file(
         )
 
         # Bước 8: Giả lập Watermark (Chỉ để hiển thị)
-        watermark_result = await document_service.embed_watermark_preview(
-            denoise_result['content'], 
-            upload_file.filename
-        )
+        if file_type == "image":
+            watermark_result = await document_service.embed_watermark_preview(
+                denoise_result['content'], 
+                upload_file.filename
+            )
+        else:
+            # Với non-image, dùng file_content gốc
+            watermark_result = await document_service.embed_watermark_preview(
+                file_content, 
+                upload_file.filename
+            )
 
         # --- Kết hợp kết quả trả về ---
         # Áp dụng giá trị mặc định cho ocrContent nếu rỗng
@@ -199,7 +225,10 @@ async def process_upload_file(
             "suggestedMetadata": suggested_metadata,
             "warnings": metadata_result.get('warnings', []),
             "conflicts": conflict_result.get('conflicts', []),
-            "denoiseInfo": denoise_result.get('denoiseInfo', {}),
+            "denoiseInfo": denoise_result.get('denoiseInfo', {}) if file_type == "image" else {
+                "denoised": False,
+                "message": f"File loại '{file_type}', bỏ qua khử nhiễu."
+            },
             "watermarkInfo": watermark_result.get('watermarkInfo', {}),
         }
 
@@ -228,7 +257,7 @@ async def process_upload_file(
 # (Khớp với hàm `handleFinalize` của frontend UC39_UploadPage.jsx)
 # =========================================================================
 
-@router.post("/insert", tags=["Document"])
+@router.post("/insert")
 async def finalize_document_upload( # Đổi tên hàm
     request: Request, 
     
@@ -277,12 +306,12 @@ async def finalize_document_upload( # Đổi tên hàm
         file_size = upload_file.file.tell()
         upload_file.file.seek(0)
         if file_size > MAX_FILE_SIZE_BYTES:
-             return JSONResponse(status_code=400, content={"status": "400", "message": "Lỗi: Kích thước file vượt quá 50MB."})
+             return JSONResponse(status_code=400, content={"status": "400", "message": f"Lỗi: Kích thước file vượt quá {MAX_FILE_SIZE_MB}MB."})
         
-        allowed_types = ['application/pdf', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document', 'image/jpeg', 'image/png', 'image/tiff', 'video/mp4', 'audio/mpeg', 'video/x-msvideo', 'audio/wav']
-        file_mime_type, _ = mimetypes.guess_type(upload_file.filename)
+        file_mime_type = document_service.get_mime_type(upload_file.file.read())
+        upload_file.file.seek(0)
         
-        if file_mime_type not in allowed_types:
+        if not is_mime_type_allowed(file_mime_type):
              return JSONResponse(status_code=400, content={"status": "400", "message": f"Định dạng file {file_mime_type} không được hỗ trợ."})
 
         await upload_file.seek(0)
@@ -306,7 +335,7 @@ async def finalize_document_upload( # Đổi tên hàm
         #     final_file_content, 
         #     unique_filename
         # )
-        # Tạm thời disable upload to Google Drive do lỗi xác thực
+        # Tạm thởi disable upload to Google Drive do lỗi xác thực
         file_id = ""  # Sử dụng chuỗi rỗng thay vì None
         file_path = f"/local_storage/{unique_filename}"  # Đường dẫn giả lập
         local_file_path = f"./uploaded_files/{unique_filename}"  # Đường dẫn cục bộ
@@ -375,7 +404,7 @@ async def finalize_document_upload( # Đổi tên hàm
         public_link = None
         # if access_type == 'public':
         #     public_link = await document_service.save_public_link(inserted_document.id, user_id)
-        # Tạm thời disable public link do lỗi Google Drive
+        # Tạm thởi disable public link do lỗi Google Drive
         # (Logic 'paid' (UC-85) đã được xử lý bởi cờ `is_paid=True` trong `insert_document`)
 
         # Bước 8: Hiển thị kết quả (Khớp với Step4_Result)
@@ -647,12 +676,11 @@ def recover_files(request: Request, doc_id: int):
 class RequestSearchBody(BaseModel):
     query: str
 
-
-@router.get("/search")
-async def find_doc_nlp(request: Request,
+@router.post("/search")
+async def find_doc_nlp(request: Request, search_body: RequestSearchBody,
                        category_id: Union[str, None] = None,
                        type_doc: Union[str, None] = None,
-                       question: Union[str, None] = "", page_num: int = 1,
+                       page_num: int = 1,
                        page_size: int = 10):
     user_id = get_request_user_id(request)
     user_id = get_request_user_id(request)

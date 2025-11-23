@@ -124,10 +124,17 @@ async def denoise_image(file_content: bytes, filename: str):
     """
     UC-39/UC-87: Khử nhiễu cho file ảnh trước OCR (Triển khai thật) 
     Sử dụng OpenCV fastNlMeansDenoisingColored.
+    
+    Mở rộng: Hỗ trợ cả PDF scan (phân loại qua classify_file_type)
     """
+    from app.utils.file_utils import classify_file_type
+    
+    # Phân loại file type để quyết định có denoise không
     mime_type = get_mime_type(file_content)
-    if not mime_type.startswith('image/'):
-        return {"content": file_content, "denoiseInfo": {"denoised": False, "message": "Không phải file ảnh, bỏ qua khử nhiễu."}}
+    file_type = classify_file_type(file_content, mime_type)
+    
+    if file_type != "image":
+        return {"content": file_content, "denoiseInfo": {"denoised": False, "message": f"File loại '{file_type}', bỏ qua khử nhiễu."}}
         
     try:
         nparr = np.frombuffer(file_content, np.uint8)
